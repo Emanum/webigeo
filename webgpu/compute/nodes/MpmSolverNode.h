@@ -320,6 +320,7 @@ private:
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_g2p_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_splat_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_rasterize_pipeline;
+    webgpu::PipelineRegistration m_pipeline_registration;
 
     /* Sizes the currently allocated resources were created for. */
     uint32_t m_allocated_particles = 0;

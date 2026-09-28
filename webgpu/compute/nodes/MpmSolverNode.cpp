@@ -139,7 +139,7 @@ MpmSolverNode::MpmSolverNode(webgpu::Context& ctx, const MpmSolverSettings& sett
             "mpm solver bind group layout");
     });
 
-    reg.register_pipeline([this](WGPUDevice device, const webgpu::RenderResourceRegistry& reg) {
+    m_pipeline_registration = reg.register_pipeline([this](WGPUDevice device, const webgpu::RenderResourceRegistry& reg) {
         const std::vector<const webgpu::raii::BindGroupLayout*> layouts { &reg.bind_group_layout("mpm_solver") };
         const auto make = [&](const std::string& shader_name) {
             return std::make_unique<webgpu::raii::CombinedComputePipeline>(device, reg.shader(shader_name), layouts);
