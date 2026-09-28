@@ -139,7 +139,7 @@ MpmSolverNode::MpmSolverNode(webgpu::Context& ctx, const MpmSolverSettings& sett
             "mpm solver bind group layout");
     });
 
-    reg.register_pipeline([this](WGPUDevice device, const webgpu::RenderResourceRegistry& reg) {
+    m_pipeline_registration = reg.register_pipeline([this](WGPUDevice device, const webgpu::RenderResourceRegistry& reg) {
         const std::vector<const webgpu::raii::BindGroupLayout*> layouts { &reg.bind_group_layout("mpm_solver") };
         const auto make = [&](const std::string& shader_name) {
             return std::make_unique<webgpu::raii::CombinedComputePipeline>(device, reg.shader(shader_name), layouts);
@@ -332,8 +332,8 @@ void MpmSolverNode::read_back_state()
     const float time = m_simulated_time;
     const float gravity = std::max(m_settings.gravity, 1e-3f);
 
-    m_state_buffer->read_back_async(m_ctx->device(), [this, time, gravity](WGPUMapAsyncStatus status, std::vector<uint32_t> data) {
-        if (status != WGPUMapAsyncStatus_Success || data.size() < SIM_STATE_SIZE_U32)
+    m_state_buffer->read_back_async(m_ctx->device(), [this, alive = lifetime_token(), time, gravity](WGPUMapAsyncStatus status, std::vector<uint32_t> data) {
+        if (alive.expired() || status != WGPUMapAsyncStatus_Success || data.size() < SIM_STATE_SIZE_U32)
             return;
         const auto as_i32 = [&data](size_t slot) {
             int32_t value = 0;
@@ -533,29 +533,17 @@ void MpmSolverNode::submit_chunk()
 
     // The callback fires from the app's event pump, i.e. once per frame - which is what
     // lets a rendered frame slip in between two chunks.
-    const auto on_work_done
-        = []([[maybe_unused]] WGPUQueueWorkDoneStatus status, [[maybe_unused]] WGPUStringView message, void* userdata, [[maybe_unused]] void* userdata2) {
-              MpmSolverNode* _this = reinterpret_cast<MpmSolverNode*>(userdata);
-              _this->m_chunks_in_flight--;
-              if (_this->m_run_substeps_left > 0) {
-                  _this->submit_chunk();
-                  return;
-              }
-              if (_this->m_chunks_in_flight > 0)
-                  return; // the last chunk is still running; its own callback finishes the run
-              _this->read_back_state();
-              _this->complete_run();
-          };
-
-    WGPUQueueWorkDoneCallbackInfo callback_info {
-        .nextInChain = nullptr,
-        .mode = WGPUCallbackMode_AllowProcessEvents,
-        .callback = on_work_done,
-        .userdata1 = this,
-        .userdata2 = nullptr,
-    };
-
-    wgpuQueueOnSubmittedWorkDone(m_ctx->queue(), callback_info);
+    on_submitted_work_done(m_ctx->queue(), [this]() {
+        m_chunks_in_flight--;
+        if (m_run_substeps_left > 0) {
+            submit_chunk();
+            return;
+        }
+        if (m_chunks_in_flight > 0)
+            return; // the last chunk is still running; its own callback finishes the run
+        read_back_state();
+        complete_run();
+    });
 }
 
 std::unique_ptr<webgpu::raii::TextureWithSampler> MpmSolverNode::create_output_texture(WGPUDevice device, uint32_t width, uint32_t height)
