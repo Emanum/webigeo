@@ -23,6 +23,9 @@ from the sources when writing the report. Full list in [refs.md](refs.md).
 | [06-verification.md](06-verification.md) | What was actually tested, how, and what is still unverified. |
 | [07-constitutive-models.md](07-constitutive-models.md) | Proposal v3.0 gap analysis: which material/friction models exist, and the design for making them exchangeable. |
 | [08-domain-size-options.md](08-domain-size-options.md) | Why the domain was 1.6 km, the options for a whole avalanche path, measured GPU cost, and what was chosen (terrain-following grid). |
+| [09-performance-analysis.md](09-performance-analysis.md) | **Performance**: why the demo felt slow, where the GPU time goes, VRAM and device limits, leaks found and fixed, main-loop/threading options, the benchmark method, and the first round of optimisations with measurements. |
+| [bench/](bench/README.md) | Standalone WebGPU benchmark of the real kernels, headless A/B against any git revision. |
+| [10-benchmark-results.md](10-benchmark-results.md) | Every checked-in benchmark result as a table: Apple M5 (Chrome/Metal) and SwiftShader, per material, per stage. Generated from `bench/results/*.json`. |
 | [report-fixed-point-energy-pump.md](report-fixed-point-energy-pump.md) | Standalone write-up of the fixed-point blow-up investigation. |
 | [refs.md](refs.md) | Bibliography. |
 
@@ -43,13 +46,15 @@ Region ─→ Select Tiles ─→ Request Height ─→ Stitch Tiles ─→ Heig
 ```
 
 One node execution = `substeps_per_run` MPM steps. Re-running continues from the current
-state, which is what makes it animate. Each step is the classic four-stage loop:
+state, which is what makes it animate. Each step is the classic MPM loop (the grid clear is
+folded into the grid update since 2026-09-27):
 
 ```
-clear grid → P2G → grid update → G2P + advection
+P2G (flags active tiles) → grid update (active tiles only, clears as it goes) → G2P + advection
 ```
 
-All of it, plus the visualisation passes, runs in a **single WebGPU compute pass**.
+All of it, plus the visualisation passes, runs in **one WebGPU compute pass per submitted
+chunk** (a few substeps per frame, paced from the measured GPU time).
 
 ## Current status
 
