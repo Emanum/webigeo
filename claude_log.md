@@ -13,6 +13,70 @@ capture of the terminal.
 
 ---
 
+## 2026-10-10
+
+### 1. AvaFrame comparison, phase 1: dataset preparation (branch `avaframe-comparison`)
+
+The plan (in Notion) compares the MPM solver with AvaFrame com1DFA on AvaFrame's own test
+cases. Phase 1 makes those cases usable: `mpm-mls-doc/avaframe/prepare_dataset.py` reads a
+pinned sparse clone of AvaFrame 2.1 (`extern/avaframe`, git-ignored). It writes, per dataset, to
+`extern/avaframe_sandbox/`:
+- the DEM;
+- the release thickness rasters;
+- the com1DFA benchmark peak rasters (pft/pfv/ppr);
+- the AIMEC path;
+- a preview PNG;
+- for real terrain, EPSG:3857 PNG overlays with `_aabb.txt` sidecars for the Overlays panel.
+
+It needs only numpy and pyproj: shapefile, dBASE, ASCII-grid and PNG I/O are hand-written.
+The tool's README has the dataset table and the conventions.
+
+**Decisions.**
+- **Release thickness is slope-normal**, so the volume is Σ t·A / cos(slope). Treating it as
+  vertical made avaKot 30 % light.
+- **References stay on com1DFA's own 5 m grid**, because it remeshes. They are not
+  resampled onto the DEM.
+- **Geolocate only if the DEM centre lies inside the CRS's area of use.** The synthetic
+  datasets ship the same Austria Lambert `.prj` with local coordinates, which would place
+  them off Liguria.
+- **GeoTIFF datasets are skipped** (avaAlr, avaFlowPy, avaMalRegional, scarpExample).
+
+**Verified:**
+- `--all` runs (23 datasets prepared, 4 skipped).
+- avaKot release volume is 21 681 m³ against com1DFA's logged 21 640 m³.
+- The avaKot preview matches AvaFrame's own plot of footprint and path.
+- The overlay sidecar matches the parser in `nucleus/utils/geopng_decoder.cpp`.
+- Real datasets land at 47.0–47.3° N, 10.3–11.7° E.
+
+**Not verified:** overlay alignment on the map in the app.
+
+**Not done:** phases 2–6 (sandbox terrain node, MPM peak rasters, display, AIMEC, model
+comparison).
+
+### 2. iOS build (PR #5, merged) — log entry added after the fact
+
+webgpu_app runs on an iPhone 17 Pro Max. The build uses:
+- Qt 6.11.1 iOS through aqt;
+- Dawn built from source for Metal, with a BC-format patch in `UtilsMetal.mm`;
+- static SDL2;
+- the Xcode generator.
+
+The fixes needed on the device were:
+- a UIScene manifest;
+- `SDL_Metal_CreateView` for rotation;
+- a smaller cloud atlas against the jetsam memory kill;
+- a repaint after resize, so the map is not black after a screenshot;
+- safe-area insets;
+- a UI scale of 0.75.
+
+Documented in `docs/webgpu_app_ios.md`.
+
+**Open:**
+- 3× resolution;
+- pinch zoom;
+- whether the top menu is reachable with the safe-area fix (not confirmed on the device);
+- replacing the temporary `TEMP-IOS-DIAG` log.
+
 ## 2026-10-03
 
 ### 1. Issue #3 audit, re-checked with Klár 2016 and Wolper 2019
