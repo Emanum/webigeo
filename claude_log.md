@@ -15,7 +15,19 @@ capture of the terminal.
 
 ## 2026-10-10
 
-### 1. AvaFrame comparison, phase 1: dataset preparation (branch `avaframe-comparison`)
+### 1. Solver in metres instead of Web Mercator units (branch `mpm-metric-units`)
+
+Found while planning the AvaFrame comparison: `MpmSolverNode` took world units (Web Mercator,
+1/cos(latitude) too long horizontally) as metres, while heights are metres. **Measured** before
+changing anything, with a temporary probe comparing the slope the solver sees against the
+Mercator-corrected release mask (30–45°): 25.3–27.3° on all three scenarios, i.e. tan 37°/1.47.
+**Fix:** region size, domain position and release centre converted to metres with
+cos(latitude of the region centre); domain box converted back for the map; panel readout from
+the node's metric domain size. **Measured after:** 35.0–37.4°. Probe removed. Doc: 04 (coordinate
+conventions), 06 §4k, 01 §5, 05. **Consequence:** all earlier real-terrain results ran on
+flattened slopes; Dachstein now produces band-ceiling contacts on its cliffs. PR #6.
+
+### 2. AvaFrame comparison, phase 1: dataset preparation (branch `avaframe-comparison`)
 
 The plan (in Notion) compares the MPM solver with AvaFrame com1DFA on AvaFrame's own test
 cases. Phase 1 makes those cases usable: `mpm-mls-doc/avaframe/prepare_dataset.py` reads a
@@ -53,7 +65,7 @@ The tool's README has the dataset table and the conventions.
 **Not done:** phases 2–6 (sandbox terrain node, MPM peak rasters, display, AIMEC, model
 comparison).
 
-### 2. iOS build (PR #5, merged) — log entry added after the fact
+### 3. iOS build (PR #5, merged) — log entry added after the fact
 
 webgpu_app runs on an iPhone 17 Pro Max. The build uses:
 - Qt 6.11.1 iOS through aqt;
