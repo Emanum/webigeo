@@ -65,6 +65,44 @@ The tool's README has the dataset table and the conventions.
 **Not done:** phases 2–6 (sandbox terrain node, MPM peak rasters, display, AIMEC, model
 comparison).
 
+### 4. AvaFrame comparison, phase 2: the sandbox in the app
+
+PR #6 (`mpm-metric-units`) was merged into this branch first, because the sandbox needs the
+solver in metres. Then:
+- **`AvaFrameSandboxNode`** loads a prepared dataset: DEM, release, and the com1DFA footprint
+  resampled onto the DEM.
+- **`MpmSolverNode`** gets an optional `sandbox` input. When it is connected:
+  - the region is in metres;
+  - the domain is centred on release plus reference footprint;
+  - seeding uses rejection sampling by release depth per cell (`release_mode = 1`);
+  - the volume per particle is the exact release volume divided by the active particles.
+- The uniform grows from 176 to 192 B; the benchmark is updated to match.
+- The release binding is now `unfilterable-float`, so it accepts both RGBA8 and R32Float.
+- The **SandboxView** window and the panel's dataset picker, plus startup keys for running
+  straight into a dataset.
+
+**Decisions.**
+- **NODATA filled as a plateau, not walls.** A wall would exceed the terrain-following band's
+  step limit.
+- **The suggested domain decides the size and the cell size:** dx = max(DEM cell, size/512).
+- **No first-run notice for the sandbox preset.**
+
+**Verified:**
+- WGSL validator and the macOS build.
+- avaKot/relKot with Li V parameters runs end to end:
+  - all 65 536 particles seeded, release volume 21 681 m³;
+  - 85 s simulated in about 65 s;
+  - the centre of mass moves north as in AvaFrame's plot;
+  - screenshot of the 2D view checked.
+- Benchmark in the browser pane, this tree against HEAD: identical physics trace and GPU time
+  (the disc path is unchanged).
+- The map scenario runs without validation errors.
+
+**Not verified:**
+- The headless CDP benchmark script returned zeros on both trees. It is a harness problem,
+  because the browser pane works.
+- The web and iOS builds of the new files (no sandbox folder there by default).
+
 ### 3. iOS build (PR #5, merged) — log entry added after the fact
 
 webgpu_app runs on an iPhone 17 Pro Max. The build uses:
