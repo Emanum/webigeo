@@ -25,7 +25,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include "util/WebInterop.h"
-#else
+#elif !defined(ALP_PLATFORM_IOS)
 #include <ImGuiFileDialog.h>
 #include <filesystem>
 #endif
@@ -265,6 +265,12 @@ bool ImGuiManager::FilePicker(const char* dialog_id,
         state.is_open = false;
         return true;
     }
+    return false;
+#elif defined(ALP_PLATFORM_IOS)
+    // No file dialog on iOS yet (ImGuiFileDialog needs system()); loading and exporting
+    // files would go through the document picker.
+    (void)dialog_id, (void)title, (void)filters, (void)wants_open, (void)out_paths;
+    (void)allow_multiple, (void)initial_path, (void)mode, (void)default_filename;
     return false;
 #else
     if (wants_open) {

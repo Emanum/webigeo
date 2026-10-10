@@ -23,6 +23,9 @@
 #include "webgpu/engine/Window.h"
 #include <QCoreApplication>
 #include <QFile>
+#ifdef ALP_PLATFORM_IOS
+#include "ios/IosScene.h"
+#endif
 #include <cassert>
 #include <qthread.h> //TODO maybe only for threading enabled?
 #include <webgpu/base/webgpu_interface.hpp>
@@ -79,8 +82,10 @@ void App::init_window()
         SDL_WINDOWPOS_CENTERED, // Window position y
         m_viewport_size.x, // Window width
         m_viewport_size.y, // Window height
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__)
         SDL_WINDOW_RESIZABLE);
+#elif defined(ALP_PLATFORM_IOS)
+        SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_RESIZABLE);
 #else
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED);
 #endif
@@ -91,6 +96,15 @@ void App::init_window()
     }
 
     util::enable_darkmode_on_windows(m_sdl_window);
+#ifdef ALP_PLATFORM_IOS
+    ios::attach_window_to_scene(m_sdl_window);
+    // The window fills the screen; size the viewport from it rather than the desktop default.
+    // In points for now, which keeps render and touch coordinates in the same units.
+    int window_width = 0, window_height = 0;
+    SDL_GetWindowSize(m_sdl_window, &window_width, &window_height);
+    if (window_width > 0 && window_height > 0)
+        m_viewport_size = glm::uvec2(window_width, window_height);
+#endif
 
 #ifndef __EMSCRIPTEN__
     // Load icon using the existing image loader
