@@ -30,4 +30,15 @@ namespace webgpu_app::ios {
 /// the scene to connect, which UIKit does shortly after launch.
 void attach_window_to_scene(SDL_Window* window);
 
+/// Size of the SDL window's UIWindow in points, as UIKit lays it out right now. SDL's own cached
+/// size can go stale: for a screenshot in landscape iOS briefly lays the app out in portrait,
+/// and after returning SDL still reports the portrait size. Returns false if unavailable.
+bool current_window_size(SDL_Window* window, int& width, int& height);
+
+/// Keeps SDL's root view and its Metal view at the window's safe area. After a screenshot in
+/// landscape (iOS lays the app out in portrait for the snapshot) UIKit does not lay SDL2's views
+/// out again, so the Metal layer keeps the snapshot's portrait frame: half the screen stays
+/// black, and after rotating back all of it. Cheap; only assigns frames that differ.
+void fit_views_to_window(SDL_Window* window);
+
 } // namespace webgpu_app::ios

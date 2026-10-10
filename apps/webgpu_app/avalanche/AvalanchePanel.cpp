@@ -19,6 +19,7 @@
 #include "AvalanchePanel.h"
 
 #include "compute/NodeGraphPanel.h"
+#include "ui/UiScale.h"
 #include <IconsFontAwesome5.h>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -455,13 +456,13 @@ void AvalanchePanel::draw_panel()
         }
     }
 
-    if (ImGui::Button(m_playing ? ICON_FA_PAUSE "  Pause" : ICON_FA_PLAY "  Play", ImVec2(110, 0)))
+    if (ImGui::Button(m_playing ? ICON_FA_PAUSE "  Pause" : ICON_FA_PLAY "  Play", ImVec2(110 * ui::UI_SCALE, 0)))
         m_playing = !m_playing;
     ImGui::SameLine();
-    if (ImGui::Button("Step", ImVec2(80, 0)))
+    if (ImGui::Button("Step", ImVec2(80 * ui::UI_SCALE, 0)))
         step_now = true;
     ImGui::SameLine();
-    if (ImGui::Button("Reset", ImVec2(80, 0))) {
+    if (ImGui::Button("Reset", ImVec2(80 * ui::UI_SCALE, 0))) {
         solver->request_reset();
         settings = solver->get_settings();
         step_now = true;

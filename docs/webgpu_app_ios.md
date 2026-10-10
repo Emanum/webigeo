@@ -4,9 +4,9 @@ How to build `webgpu_app` for iPhone and run it on your own device from a Mac. T
 never been built for mobile before; the Android CI job builds the older OpenGL QML app, and
 `ALP_BUILD_WEBGPU_APP` defaults to `OFF` on Apple and Android. Everything below is new.
 
-Status (2026-10-10): builds, signs, installs and starts on an iPhone 17 Pro Max (iOS 27, Xcode 27).
-The WebGPU device comes up on Metal. Rendering on the device is the next milestone; see
-[Open work](#open-work).
+Status (2026-10-10): runs on an iPhone 17 Pro Max (iOS 27, Xcode 27). The map renders, touch input
+works, the avalanche simulation runs on the phone's GPU, and rotation, screenshots and the app
+switcher are handled. Rendering is at the point size (1x) for now; see [Open work](#open-work).
 
 ## Overview
 
@@ -174,6 +174,12 @@ is JSON after its first line; the triggered thread's frames show where it crashe
 | The macOS packaging step (macdeployqt, copying dylibs into the bundle, ad-hoc signing) breaks under Xcode | skipped on iOS: everything links statically and Xcode signs |
 | Metal layer sized in points, rendering at a third of the resolution | `webgpu_interface.cpp` sets `contentsScale` and a pixel `drawableSize`; the window is fullscreen and the viewport is taken from it |
 | BC4 cloud texture aborts in Dawn | the Dawn patch above |
+| Killed right after start (`SDL_APP_LOWMEMORY`, then SIGKILL, no crash report) | the cloud atlas is allocated in full at startup: 1 GiB of BC4 at `ATLAS_BITS_Z = 5`. On iOS it is 2 (~146 MiB, 64 instead of 512 cloud tiles), `webgpu/engine/cloud/CloudRenderer.h` |
+| Rotation: the hand-made `CAMetalLayer` kept its first frame | the surface uses `SDL_Metal_CreateView` (window created with `SDL_WINDOW_METAL`) |
+| GPU work while in the background (a screenshot or the app switcher is enough) | an SDL event watch pauses rendering between `SDL_APP_WILLENTERBACKGROUND` and `SDL_APP_DIDENTERFOREGROUND`; on return the surface is reconfigured |
+| Screenshot in landscape: iOS lays the app out in portrait for the snapshot; afterwards SDL still reports portrait and UIKit does not lay SDL2's views out again (half black, then all black after rotating back) | every frame on iOS, `ios::fit_views_to_window()` sets SDL's root view and Metal view to the window's safe area, and the viewport follows the UIKit size (`ios::current_window_size()`) instead of SDL's cached one |
+| Map black under a live UI after a resize back to the same size | `App::on_window_resize()` always forces one map repaint: the framebuffer is recreated empty, and the camera only requests a redraw when the viewport changed |
+| UI covers the screen; top edge and Dynamic Island take the touches | `ui/UiScale.h`: 0.75 on iOS for fonts, spacing, the sidebar and fixed button widths. The app draws only in the safe area (black bars outside), and `SDL_HINT_IOS_HIDE_HOME_INDICATOR=2` makes edge swipes need a second swipe |
 
 All iOS-specific code is behind `if (IOS)` in CMake or `#ifdef ALP_PLATFORM_IOS` in C++.
 
@@ -189,11 +195,13 @@ arm64 simulator app cannot link against it. Ways out, none done:
 
 ## Open work
 
-- First frame on the device: confirm the map renders after the Dawn patch.
 - Full resolution: report pixel sizes (`SDL_WINDOW_ALLOW_HIGHDPI`, `SDL_GetWindowSizeInPixels`)
-  and convert touch coordinates; currently rendering happens at the point size.
-- Rotation: the Metal layer's frame is set once and is not resized with the window.
-- Background: stop rendering on `SDL_APP_WILLENTERBACKGROUND`, or iOS kills the app.
-- Touch: one finger as mouse works through SDL; pinch zoom and larger ImGui scaling are missing.
-- Replace the `TEMP-IOS-DIAG` log redirect with a proper option.
+  and convert touch coordinates; currently rendering happens at the point size, so text and the
+  map are soft.
+- Edge-to-edge map: the app is inset to the safe area; drawing the map full screen with only the
+  UI inset needs the panels to place themselves inside the safe area.
+- Touch: one finger as mouse works through SDL; pinch zoom is missing.
+- The iOS workarounds around SDL2's window (scene attachment, view fitting) would go away with
+  SDL3, which supports UIScene.
+- Replace the `TEMP-IOS-DIAG` log redirect and SDL event logging with a proper option.
 - Timestamp queries may be unavailable on iOS; the avalanche panel's pacing then stays manual.

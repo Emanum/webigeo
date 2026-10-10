@@ -21,6 +21,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
 
+#import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
 
 #include <QDebug>
@@ -62,6 +63,47 @@ void attach_window_to_scene(SDL_Window* window)
     ui_window.windowScene = scene;
     ui_window.frame = scene.coordinateSpace.bounds;
     [ui_window makeKeyAndVisible];
+}
+
+namespace {
+    // The part of the window the app draws into: the safe area, i.e. clear of the Dynamic
+    // Island, the top edge (status bar / notification gesture) and the home indicator. The UI
+    // positions its windows at the screen edges, and the system takes touches there.
+    CGRect content_rect(UIWindow* ui_window) { return UIEdgeInsetsInsetRect(ui_window.bounds, ui_window.safeAreaInsets); }
+} // namespace
+
+bool current_window_size(SDL_Window* window, int& width, int& height)
+{
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(window, &info) || info.subsystem != SDL_SYSWM_UIKIT || info.info.uikit.window == nil)
+        return false;
+    const CGSize size = content_rect(info.info.uikit.window).size;
+    width = int(size.width);
+    height = int(size.height);
+    return width > 0 && height > 0;
+}
+
+void fit_views_to_window(SDL_Window* window)
+{
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(window, &info) || info.subsystem != SDL_SYSWM_UIKIT || info.info.uikit.window == nil)
+        return;
+    UIWindow* ui_window = info.info.uikit.window;
+    UIView* root = ui_window.rootViewController.view;
+    if (root == nil)
+        return;
+    // SDL's root view is also the view that receives touches, so insetting it keeps render and
+    // touch coordinates consistent. The bars outside the safe area stay black.
+    ui_window.backgroundColor = UIColor.blackColor;
+    const CGRect frame = content_rect(ui_window);
+    if (!CGRectEqualToRect(root.frame, frame))
+        root.frame = frame;
+    for (UIView* sub in root.subviews) {
+        if ([sub.layer isKindOfClass:[CAMetalLayer class]] && !CGRectEqualToRect(sub.frame, root.bounds))
+            sub.frame = root.bounds;
+    }
 }
 
 } // namespace webgpu_app::ios

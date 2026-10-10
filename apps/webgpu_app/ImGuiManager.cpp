@@ -22,6 +22,7 @@
 #include "RenderingContext.h"
 
 #include "ui/ImGuiPanel.h"
+#include "ui/UiScale.h"
 
 #ifdef __EMSCRIPTEN__
 #include "util/WebInterop.h"
@@ -58,6 +59,8 @@
 
 namespace webgpu_app {
 
+using ui::UI_SCALE;
+
 ImGuiManager::ImGuiManager(App* terrain_renderer)
     : m_terrain_renderer(terrain_renderer)
 {
@@ -87,6 +90,8 @@ void ImGuiManager::init(
     ImGui_ImplWGPU_Init(&init_info);
 
     webgpu_app::util::setup_darkmode_imgui_style();
+    if (UI_SCALE != 1.0f)
+        ImGui::GetStyle().ScaleAllSizes(UI_SCALE);
     install_fonts();
 
     auto* rc = m_terrain_renderer->get_rendering_context();
@@ -134,10 +139,10 @@ void ImGuiManager::install_fonts()
 {
     ImGuiIO& io = ImGui::GetIO();
 
-    float baseFontSize = 16.0f;
-    float iconFontSize = 14.0f;
-    float smallFontSize = 14.0f;
-    float smallIconFontSize = 12.0f;
+    float baseFontSize = 16.0f * UI_SCALE;
+    float iconFontSize = 14.0f * UI_SCALE;
+    float smallFontSize = 14.0f * UI_SCALE;
+    float smallIconFontSize = 12.0f * UI_SCALE;
 
     QByteArray robotoData;
     {
@@ -324,7 +329,7 @@ bool ImGuiManager::FloatingToggleButton(const char* id, const char* icon, const 
     s_tool_button_y -= 48 + 10;
     ImGui::SetNextWindowPos(button_pos, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(on ? 0.5f : 0.2f); // fade the background when disabled
-    ImGui::SetNextWindowSize(ImVec2(48, 48));
+    ImGui::SetNextWindowSize(ImVec2(48 * UI_SCALE, 48 * UI_SCALE));
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin(id, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
@@ -358,8 +363,8 @@ void ImGuiManager::draw()
     s_tool_button_y = ImGui::GetIO().DisplaySize.y - 48.0f - 40.0f;
 
     // Main sidebar window with CollapsingHeader sections.
-    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 430, 0)); // Set position to top-right corner
-    ImGui::SetNextWindowSize(ImVec2(430, ImGui::GetIO().DisplaySize.y)); // Set height to full screen height, width as desired
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 430 * UI_SCALE, 0)); // Set position to top-right corner
+    ImGui::SetNextWindowSize(ImVec2(430 * UI_SCALE, ImGui::GetIO().DisplaySize.y)); // Set height to full screen height, width as desired
     ImGui::Begin("weBIGeo", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
 
     for (auto& panel : m_panels)
