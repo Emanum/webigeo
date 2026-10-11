@@ -31,6 +31,7 @@
 namespace webgpu_compute::nodes {
 class MpmSolverNode;
 class AvaFrameSandboxNode;
+struct SandboxTerrain;
 class GeoRegionNode;
 class SelectTilesNode;
 class Node;
@@ -126,8 +127,9 @@ public:
     void draw_panel() override;
 
 signals:
-    /// "Show on the map" for a geolocated sandbox dataset; connected to the camera controller.
-    void fly_to_requested(double latitude, double longitude);
+    /// "Show on the map" for a geolocated sandbox dataset: a camera looking at the avalanche
+    /// steeply from the south, framing it. World coordinates; connected to the camera controller.
+    void camera_requested(glm::dvec3 position, glm::dvec3 look_at);
 
 private:
     /// Looks up the solver in the currently loaded graph. Returns nullptr if the active
@@ -192,11 +194,20 @@ private:
         float max_time = 400.0f; // [s] simulated; com1DFA's default tEnd
         bool trajectories = false; // "model": "trajectories" - the weBIGeo trajectory model instead of the MPM
     };
-    enum class BatchPhase { Idle, Loading, Running, Exporting, Done };
+    enum class BatchPhase { Idle, Loading, Running, Exporting, ShotSandbox, ShotMap, Done };
     bool load_batch(const QString& path);
     void start_batch_run();
     void batch_tick();
     void finish_batch();
+    /// Frames a geolocated sandbox dataset on the map (emits camera_requested).
+    void frame_on_map(const webgpu_compute::nodes::SandboxTerrain& terrain);
+    /// Frames a map scenario's domain once the solver has scanned its terrain (the altitude to
+    /// look at comes from that scan), so picking a location also takes the camera there.
+    void frame_scenario_when_ready(webgpu_compute::nodes::MpmSolverNode& solver);
+    /// Batch screenshots: logs "AvaFrame batch: screenshot <path>" for an external script to
+    /// capture the window, then waits until the file exists (or a timeout).
+    void request_screenshot(const std::string& path);
+    bool screenshot_done();
 
 private:
     NodeGraphPanel* m_graph_panel;
@@ -209,6 +220,7 @@ private:
     std::vector<Scenario> m_scenarios;
     int m_selected_scenario = 0;
     std::string m_scenario_error;
+    const Scenario* m_frame_pending = nullptr; // scenario to frame on the map once its terrain is in
 
     std::vector<MaterialPreset> m_material_presets;
     int m_selected_material_preset = 0; // 0 = custom (no preset active)
@@ -235,6 +247,9 @@ private:
     bool m_batch_quit = true;
     QJsonArray m_batch_results;
     std::chrono::steady_clock::time_point m_batch_run_started;
+    bool m_batch_screenshots = false; // "screenshots": true - sandbox view and map per MPM run
+    std::string m_screenshot_path; // pending screenshot
+    std::chrono::steady_clock::time_point m_phase_started;
     SandboxView m_sandbox_view;
 
     /* Simulated seconds per wall-clock second, measured over ~1 s windows while playing. */

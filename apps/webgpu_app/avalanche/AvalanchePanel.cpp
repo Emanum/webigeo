@@ -57,6 +57,22 @@ AvalanchePanel::AvalanchePanel(NodeGraphPanel* graph_panel)
               glm::dvec2(47.07900, 12.70200), 8000.0f, 15, glm::dvec2(47.07900, 12.70200), 4000.0f, 320, glm::dvec2(47.07500, 12.69600), 150.0f, 2.0f },
           Scenario { "Dachstein (Hallstatt Glacier)", "North side of the Dachstein plateau above the glacier.",
               glm::dvec2(47.47800, 13.60600), 8000.0f, 15, glm::dvec2(47.47800, 13.60600), 4000.0f, 320, glm::dvec2(47.47300, 13.60400), 130.0f, 2.0f },
+          // AvaFrame's five real test avalanches (the ones the comparison uses), on the map. Domain:
+          // about 1.4x the sandbox's (release and com1DFA footprint with a margin), because on the
+          // map's terrain the flow spreads further across the valley floors. Release: a disc of the
+          // same area as AvaFrame's release area (its largest part for Madlein), on its centroid;
+          // the map masks it with its own 30-45 degree release slopes. Slab: AvaFrame's
+          // slope-normal thickness as vertical depth. The exact release runs in the AvaFrame sandbox.
+          Scenario { "Kontertal (AvaFrame avaKot)", "AvaFrame test avalanche, Lechtal. Release approximated by a disc; exact in the AvaFrame sandbox.",
+              glm::dvec2(47.25740, 10.39954), 4600.0f, 15, glm::dvec2(47.25740, 10.39954), 2600.0f, 325, glm::dvec2(47.25227, 10.39604), 70.0f, 1.4f },
+          Scenario { "Gallreide (AvaFrame avaGar)", "AvaFrame test avalanche, event of February 2009. Release approximated by a disc.",
+              glm::dvec2(47.04659, 11.33737), 4900.0f, 15, glm::dvec2(47.04659, 11.33737), 2900.0f, 363, glm::dvec2(47.05046, 11.32931), 114.0f, 1.5f },
+          Scenario { "Hintertux (AvaFrame avaHit)", "AvaFrame test avalanche, Tuxertal. Release approximated by a disc.",
+              glm::dvec2(47.11677, 11.67028), 5200.0f, 15, glm::dvec2(47.11677, 11.67028), 3200.0f, 400, glm::dvec2(47.12098, 11.66391), 261.0f, 1.24f },
+          Scenario { "Wolfsgruben (AvaFrame avaWog)", "AvaFrame test avalanche, event of 1988. Release approximated by a disc.",
+              glm::dvec2(47.12760, 10.28294), 5400.0f, 15, glm::dvec2(47.12760, 10.28294), 3400.0f, 425, glm::dvec2(47.12161, 10.28847), 207.0f, 1.21f },
+          Scenario { "Madlein (AvaFrame avaMal)", "AvaFrame test avalanche above Ischgl, event of 1984. Release: disc on the largest of its release areas.",
+              glm::dvec2(47.02478, 10.28108), 6500.0f, 15, glm::dvec2(47.02478, 10.28108), 4500.0f, 512, glm::dvec2(47.03342, 10.27979), 298.0f, 1.24f },
       })
     , m_material_presets({
           // name, note, model, E, nu, rho, mu, | Stomakhin xi, theta_c, theta_s | DP phi | CCC M, beta, xi, p0
@@ -291,8 +307,29 @@ bool AvalanchePanel::apply_scenario(const Scenario& scenario)
     solver->set_settings(solver_settings);
 
     m_playing = false; // the terrain has to be fetched and stitched before stepping again
+    m_frame_pending = &scenario; // m_scenarios never changes size, so the pointer stays valid
     graph->run();
     return true;
+}
+
+void AvalanchePanel::frame_scenario_when_ready(nodes::MpmSolverNode& solver)
+{
+    if (m_frame_pending == nullptr)
+        return;
+    // Wait for the run of this scenario: the domain sits on its centre and the terrain scan of
+    // its reset has been read back (until then last_state() is invalid or the previous one).
+    const auto& aabb = solver.domain_aabb();
+    if (aabb.size().x <= 0.0 || !solver.last_state().valid)
+        return;
+    const glm::dvec2 centre = nucleus::srs::world_to_lat_long((aabb.min + aabb.max) * 0.5);
+    if (glm::length(centre - m_frame_pending->domain_center) > 0.01)
+        return;
+    const auto& state = solver.last_state();
+    const glm::dvec3 look_at(nucleus::srs::lat_long_to_world(m_frame_pending->domain_center), 0.5 * double(state.min_altitude + state.max_altitude));
+    // Steeply from the south, far enough to frame the domain (world units are 1/cos(lat) m).
+    const double distance = 1.5 * double(solver.domain_size_metres()) / std::max(solver.metres_per_world_unit(), 0.1);
+    emit camera_requested(look_at + glm::normalize(glm::dvec3(0.0, -0.45, 1.0)) * distance, look_at);
+    m_frame_pending = nullptr;
 }
 
 void AvalanchePanel::apply_material_preset(const MaterialPreset& preset)
@@ -412,8 +449,45 @@ void AvalanchePanel::configure_sandbox_solver(const nodes::AvaFrameSandboxNode& 
     if (solver.has_valid_inputs())
         solver.rerun();
     // A real dataset also shows on the map (AvaFrameSandboxNode::update_map_overlay): go there.
-    if (terrain->centre_lat_lon)
-        emit fly_to_requested(terrain->centre_lat_lon->x, terrain->centre_lat_lon->y);
+    if (terrain->sandbox_to_world)
+        frame_on_map(*terrain);
+}
+
+void AvalanchePanel::frame_on_map(const nodes::SandboxTerrain& terrain)
+{
+    if (!terrain.sandbox_to_world)
+        return;
+    // Look at the avalanche (release and com1DFA footprint, the suggested domain) from the south,
+    // steeply, at a distance that frames it. The fly-to of the search panel looks from 45 degrees
+    // at 5 km, which hides north-facing gullies behind their ridge.
+    const glm::dvec2 centre = terrain.suggested_domain_centre;
+    const glm::dvec2 world = glm::dvec2(*terrain.sandbox_to_world * glm::dvec3(centre, 1.0));
+    const double world_per_metre = glm::length(glm::dvec2((*terrain.sandbox_to_world)[0]));
+    const glm::ivec2 cell = glm::clamp(glm::ivec2(int(centre.x / terrain.cellsize), int(terrain.grid_size.y) - 1 - int(centre.y / terrain.cellsize)),
+        glm::ivec2(0), glm::ivec2(terrain.grid_size) - glm::ivec2(1));
+    const double altitude = double(terrain.heights.pixel(glm::uvec2(cell)));
+    const glm::dvec3 look_at(world, altitude);
+    const double distance = 1.5 * terrain.suggested_domain_size * world_per_metre;
+    emit camera_requested(look_at + glm::normalize(glm::dvec3(0.0, -0.45, 1.0)) * distance, look_at);
+}
+
+void AvalanchePanel::request_screenshot(const std::string& path)
+{
+    QFile::remove(QString::fromStdString(path));
+    m_screenshot_path = path;
+    m_phase_started = std::chrono::steady_clock::now();
+    qInfo().nospace() << "AvaFrame batch: screenshot " << QString::fromStdString(path);
+}
+
+bool AvalanchePanel::screenshot_done()
+{
+    if (m_screenshot_path.empty() || QFile::exists(QString::fromStdString(m_screenshot_path)))
+        return true;
+    if (std::chrono::steady_clock::now() - m_phase_started > std::chrono::seconds(20)) {
+        qWarning() << "AvaFrame batch: no screenshot after 20 s (is the capture script running?)" << QString::fromStdString(m_screenshot_path);
+        return true;
+    }
+    return false;
 }
 
 void AvalanchePanel::export_sandbox_result(const std::string& stopped_by)
@@ -531,7 +605,7 @@ void AvalanchePanel::draw_sandbox_section(nodes::AvaFrameSandboxNode& sandbox)
     if (const nodes::SandboxTerrain* t = sandbox.terrain(); t != nullptr && t->centre_lat_lon) {
         ImGui::SameLine();
         if (ImGui::Button("Show on the map"))
-            emit fly_to_requested(t->centre_lat_lon->x, t->centre_lat_lon->y);
+            frame_on_map(*t);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Flies the camera to the dataset. The overlay there shows the release (cyan), the MPM peak flow\n"
                               "thickness above 0.1 m (colour scale of the sandbox view) and the com1DFA footprint (green),\n"
@@ -567,6 +641,7 @@ bool AvalanchePanel::load_batch(const QString& path)
         m_batch.push_back(std::move(run));
     }
     m_batch_quit = root["quit"].toBool(true);
+    m_batch_screenshots = root["screenshots"].toBool(false);
     m_batch_file = path;
     if (m_batch.empty()) {
         qWarning() << "AvaFrame batch: no runs in" << path;
@@ -683,6 +758,16 @@ void AvalanchePanel::batch_tick()
         for (auto it = run.settings.begin(); it != run.settings.end(); ++it)
             settings[it.key()] = it.value();
         solver.deserialize_settings(settings); // also requests the reset
+        // The time step from the CFL bound of this run's own grid and material, unless the run
+        // sets one. Otherwise dt is whatever the previous run left (presets and the domain setup
+        // only ever lower it), and a run's result would depend on its place in the batch.
+        if (!run.settings.contains("dt")) {
+            auto s = solver.get_settings();
+            const float dx = std::min(s.domain_size_xy, float(std::max(t->size_metres.x, t->size_metres.y)))
+                / float(std::clamp(s.grid_resolution_xy, 8u, nodes::MpmSolverNode::MAX_GRID_RESOLUTION_XY));
+            s.dt = 0.8f * nodes::MpmSolverNode::max_stable_dt(s, dx);
+            solver.set_settings(s);
+        }
         m_sandbox_stopped = false;
         m_playing = true;
         m_batch_phase = BatchPhase::Running;
@@ -706,9 +791,44 @@ void AvalanchePanel::batch_tick()
             return;
         m_batch_results.append(QJsonObject { { "label", QString::fromStdString(run.label) }, { "dataset", QString::fromStdString(run.dataset) },
             { "result", QString::fromStdString(m_last_export) } });
+        if (m_batch_screenshots && m_last_export.rfind("error", 0) != 0) {
+            // The sandbox view with the MPM peak thickness first, then the map with the overlay.
+            m_sandbox_view.open = true;
+            m_sandbox_view.set_layer(SandboxView::Layer::MpmThickness);
+            m_screenshot_path.clear();
+            m_phase_started = std::chrono::steady_clock::now();
+            m_batch_phase = BatchPhase::ShotSandbox;
+            return;
+        }
         m_batch_index++;
         start_batch_run();
         return;
+    case BatchPhase::ShotSandbox:
+    case BatchPhase::ShotMap: {
+        const bool sandbox_shot = m_batch_phase == BatchPhase::ShotSandbox;
+        if (m_screenshot_path.empty()) {
+            // Wait until the view (and the map overlay) show this run's final peaks, then a moment
+            // for the frames and the map tiles to settle.
+            const bool settled = std::chrono::steady_clock::now() - m_phase_started > std::chrono::milliseconds(sandbox_shot ? 1500 : 2500);
+            if (!m_sandbox_view.peaks_current(solver.simulated_time()) || !settled)
+                return;
+            request_screenshot(m_last_export + (sandbox_shot ? "/sandbox.png" : "/map.png"));
+            return;
+        }
+        if (!screenshot_done())
+            return;
+        m_screenshot_path.clear();
+        if (sandbox_shot) {
+            m_sandbox_view.open = false;
+            m_phase_started = std::chrono::steady_clock::now();
+            m_batch_phase = BatchPhase::ShotMap;
+            return;
+        }
+        m_sandbox_view.open = true;
+        m_batch_index++;
+        start_batch_run();
+        return;
+    }
     default:
         return;
     }
@@ -730,6 +850,9 @@ void AvalanchePanel::finish_batch()
 
 void AvalanchePanel::draw()
 {
+    if (auto* solver = find_solver(); solver != nullptr && find_node<nodes::AvaFrameSandboxNode>() == nullptr)
+        frame_scenario_when_ready(*solver);
+
     if (m_batch_phase != BatchPhase::Idle && m_batch_phase != BatchPhase::Done && m_batch_index < m_batch.size()) {
         if (auto* sandbox = find_node<nodes::AvaFrameSandboxNode>(); sandbox != nullptr && find_solver() != nullptr)
             configure_sandbox_solver(*sandbox, *find_solver());
@@ -839,6 +962,11 @@ void AvalanchePanel::draw_performance(nodes::MpmSolverNode& solver)
 
 void AvalanchePanel::draw_panel()
 {
+    // The buttons below can load another preset ("Back to the map", "AvaFrame sandbox"), which
+    // replaces the graph and destroys every node in it, the solver included. Once that happened,
+    // stop drawing this frame; the next one finds the new nodes.
+    const auto* graph_at_start = m_graph_panel->node_graph();
+    const auto graph_replaced = [&] { return m_graph_panel->node_graph() != graph_at_start; };
     auto* solver = find_solver();
     if (!ImGui::CollapsingHeader(ICON_FA_SNOWFLAKE "  Avalanche", ImGuiTreeNodeFlags_DefaultOpen))
         return;
@@ -897,6 +1025,8 @@ void AvalanchePanel::draw_panel()
         ImGui::Separator();
     }
 
+    if (graph_replaced())
+        return;
     const bool ready = solver->has_valid_inputs();
     if (!ready) {
         m_playing = false;
