@@ -230,6 +230,82 @@ Each batch run now sets 0.8 × CFL for its own grid, and all MPM runs were redon
 - **First draft corrected:** it called that pattern a size effect, but avaHit (268 000 m³) fits
   at 0.55. The doc now relates it to com1DFA's travel angle instead.
 
+### 11. prepare_dataset.py ported to C++, behind a download button (2026-10-11)
+
+**Request:** port the preparation script to C++, trigger it from a button, and show a popup
+saying the data is external, may disappear, and takes a while.
+
+**What was built:**
+- **`apps/webgpu_app/avalanche/AvaFrameData.{h,cpp}`.** It covers the five real datasets.
+  - It downloads 62 files (about 40 MB) from raw.githubusercontent.com, pinned to the 2.1
+    commit, with a hardcoded manifest.
+  - It parses the ESRI grids, shapefiles and dbf tables, rasterises the release polygons,
+    projects EPSG:31287 to WGS 84, and writes the same files as the script.
+  - It merges its entries into `index.json` and deletes nothing.
+  - Not ported: the preview and overlay PNGs, which nothing reads, and the synthetic datasets.
+- **Panel.** "Download AvaFrame data..." in the sandbox section opens a modal: external data
+  that AvaFrame may move or remove, about 40 MB, takes a while, where it is saved, data sources.
+  While it runs, the panel shows a progress bar, the status and a cancel button. When it
+  finishes, the panel lists the datasets again and reloads the selected one.
+- **Default sandbox root without a source tree** (web, iOS): the app data folder; on the web
+  that is browser memory.
+
+**Decisions:**
+- **Number parsing and formatting** go through Qt (`QByteArrayView::toDouble`,
+  `QByteArray::number`), because Qt sets the C locale from the environment and
+  `strtod`/`printf` would then use a German decimal comma. Floating `std::from_chars` is
+  unavailable for this macOS target.
+- **Exact ties are rounded to even,** like Python's `%.3f`. Without that, 56–192 DEM cells per
+  dataset came out 1 mm different.
+- **The projection is written out** instead of using PROJ: inverse LCC on Bessel 1841, then
+  "MGI to WGS 84 (8)", a 7-parameter Helmert in coordinate-frame convention. That is the
+  transformation pyproj picked for the script.
+- **Threads.** Preparation runs on `QThreadPool` natively. The web build runs it queued on the
+  main thread. Results carry a run counter, so a cancelled run's result is dropped.
+
+**Verified:**
+- **Output against the script.** A scratch harness built `AvaFrameData.cpp` alone and ran the
+  real download into a scratch folder, in 1.2 s. Compared with `prepare_dataset.py`'s output:
+  every `.asc` is byte-identical, and every JSON file has the same content.
+- **Projection against pyproj:** at most 0.05 mm apart across Austria.
+- **Builds.** The macOS debug and wasm release builds compile, with no warnings from the new
+  code.
+- **Web fetch.** In the served wasm page (cross-origin isolated, COEP `require-corp`), both
+  fetch and XHR to the pinned raw URLs return 200.
+
+**Verified by the user:** the panel flow at run time works (popup, download, reload). I could
+not drive it myself: the browser pane was hidden, so the page ran at one frame per second.
+
+Mistake on the way: the harness took a quoted coordinate pair as an output folder and twice
+wrote stray folders into the repository root. Both were removed; the harness now requires
+`--out`.
+
+### 10. Where the AvaFrame test data comes from, before redistributing it in the web build (2026-10-11)
+
+The user decided to bundle the five real avalanches with the web build rather than load them
+from AvaFrame's repository at run time. They asked first where the data originally comes from.
+
+- **Terrain (DEM).** It is Land Tirol's "Digitales Geländemodell Tirol" (5 m) from Open Data Austria.
+  The dataset's licence on data.gv.at is **CC BY 4.0** on every distribution. Verified through the
+  hub API, record `0454f5f3-1d8c-464e-847d-541901eb021a`. The required attribution is
+  "Datenquelle: Land Tirol - data.tirol.gv.at".
+- **Release areas and thicknesses.** These came from the Austrian Torrent and Avalanche Service
+  (WLV, die-wildbach.at), through FZGL Fachbereich Lawinen, in November 2020. The dbf comments
+  ("Gutachterlich auf Basis Ereignis …") show they are expert assessments from hazard zoning.
+  AvaFrame's dataSources page says the data was "kindly provided" and names **no licence**.
+  No open-data listing for it was found.
+- **AvaFrame.** The repository is EUPL-1.2 as a whole, with one `LICENSE.txt` and no separate
+  data licence. `MANIFEST.in` prunes `avaframe/data`, so the PyPI package does not contain the
+  data; only the Git repository does.
+- **com1DFA reference rasters.** We generate these ourselves with AvaFrame code from the
+  inputs above, so they are derived from both sources.
+
+**Open:** whether the WLV release data may be redistributed outside AvaFrame. It is
+distributed publicly in AvaFrame's EUPL repository, but nothing states the WLV's terms.
+
+**Decision:** do not redistribute. The sandbox stays native-only, and the reason is written in the
+meeting notes of 13.10. and in `mpm-mls-doc/11-avaframe-comparison.md` §4.
+
 ### 3. iOS build (PR #5, merged) — log entry added after the fact
 
 webgpu_app runs on an iPhone 17 Pro Max. The build uses:
