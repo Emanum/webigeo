@@ -27,10 +27,13 @@
 
 #include <array>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <vector>
 
 namespace webgpu_compute::nodes {
+
+struct SandboxTerrain;
 
 /// Real-time snow avalanche simulation using MLS-MPM (Hu et al. 2018) with the snow
 /// constitutive model of Stomakhin et al. 2013.
@@ -48,6 +51,12 @@ namespace webgpu_compute::nodes {
 /// The result is published both as a top-down density raster (storage buffer, for export
 /// or the generic BufferToTextureNode) and as a ready-to-display RGBA texture together
 /// with the AABB of the simulated domain, so it can be wired straight into an overlay.
+///
+/// Two ways to feed it terrain. On the map, the region is in world units (Web Mercator) and
+/// domain and release are placed by latitude/longitude, the release being a disc masked by
+/// the release point texture. With the optional "sandbox" input connected (AvaFrameSandboxNode),
+/// the region is a DEM in metres, the domain is centred on the dataset's avalanche and the
+/// release texture holds the release depth per cell.
 class MpmSolverNode : public Node {
     Q_OBJECT
 
@@ -168,6 +177,11 @@ public:
 
         uint32_t random_seed = 1u;
 
+        /* Stop criterion of com1DFA: the flow has stopped once the kinetic energy has fallen
+         * below this fraction of its peak since the reset - "< 1.00 percent of PKE" in the
+         * AvaFrame benchmark runs. 0 = never. Reported by at_rest(); the caller decides. */
+        float stop_kinetic_fraction = 0.01f;
+
         /* Debug aid: fill the whole domain with snow instead of only the release areas.
          * Useful to confirm the solver and the domain placement before hunting for a
          * release area to sit on. */
@@ -225,8 +239,13 @@ private:
         float ccc_beta;
         float ccc_xi;
         float ccc_p0_initial;
+
+        uint32_t release_mode; // 0 = disc masked by release points, 1 = depth per cell (sandbox)
+        float release_volume; // [m^3], release_mode 1
+        float release_max_depth; // [m], release_mode 1
+        float release_half_y; // half height of the release bounds [m], release_mode 1 (release_radius = half width)
     };
-    static_assert(sizeof(MpmSolverSettingsUniform) == 176, "uniform layout must match the WGSL struct");
+    static_assert(sizeof(MpmSolverSettingsUniform) == 192, "uniform layout must match the WGSL struct");
 
 public:
     MpmSolverNode(webgpu::Context& ctx);
@@ -246,6 +265,8 @@ public:
 
     /// Simulated time [s] accumulated since the last reset.
     float simulated_time() const { return m_simulated_time; }
+    /// Wall-clock seconds since the last reset, pauses included.
+    float wall_time_since_reset() const { return std::chrono::duration<float>(std::chrono::steady_clock::now() - m_reset_wall_start).count(); }
 
     /// World space bounds of the simulated box. Only meaningful after the first run.
     const radix::geometry::Aabb<2, double>& domain_aabb() const { return m_domain_aabb; }
@@ -253,8 +274,13 @@ public:
     /// Edge length of the simulated box in metres, after clamping to the region. The solver
     /// works in metres; world units are Web Mercator (see update_gpu_settings).
     float domain_size_metres() const { return m_settings_uniform.data.domain_size_xy; }
-    /// Metres per world unit at the region, cos(latitude). 1 until the first run.
+    /// Metres per world unit at the region, cos(latitude). 1 until the first run, and 1 in
+    /// the sandbox, whose region is already in metres.
     double metres_per_world_unit() const { return m_metres_per_world_unit; }
+
+    /// The sandbox the solver runs on, or nullptr when it runs on the map (the optional
+    /// "sandbox" input is not connected or its node has not run).
+    const SandboxTerrain* sandbox();
 
     /// Diagnostics read back from the GPU after each run. Arrives asynchronously, so it
     /// describes the *previous* completed run; `valid` is false until the first readback.
@@ -278,6 +304,34 @@ public:
         float release_area_share = 0.0f; // share of the release disc that holds snow (seeding estimate)
     };
     const SimStateReadback& last_state() const { return m_last_state; }
+
+    /// True once the mean kinetic energy has fallen below stop_kinetic_fraction of its peak
+    /// since the reset (com1DFA's stop criterion). Like last_state(), one run behind.
+    bool at_rest() const { return m_at_rest; }
+
+    /// Box contacts (see SimStateReadback) summed over every run since the reset, and the
+    /// particle-substeps they are a share of. Non-zero walls mean the runout depends on the box.
+    struct BoundaryContacts {
+        uint64_t ceiling = 0;
+        uint64_t wall = 0;
+        uint64_t particle_substeps = 0;
+    };
+    const BoundaryContacts& contacts_since_reset() const { return m_contacts_since_reset; }
+
+    /// Peak flow depth and depth-averaged speed per grid column since the last reset, read
+    /// back from the GPU (column_peaks in mpm_common.wgsl). Column (i, j) is the grid node at
+    /// domain origin + (i, j) dx; j grows northwards.
+    struct ColumnPeaks {
+        glm::uvec2 size = glm::uvec2(0);
+        glm::dvec2 domain_origin = glm::dvec2(0.0); // region-relative metres (sandbox metres in the sandbox)
+        float dx = 0.0f;
+        float simulated_time = 0.0f;
+        std::vector<float> depth; // [m], vertical: snow volume per horizontal area
+        std::vector<float> speed; // [m/s]
+    };
+    /// Copies the peaks to a staging buffer and maps it; the callback fires from the event pump
+    /// a frame or so later, and not at all if the node is destroyed first.
+    void read_back_peaks(std::function<void(const ColumnPeaks&)> callback);
 
     /// One point of the energy-line record (Tonnel et al. 2023, com1DFA section 5.2 and
     /// App. A): mass-averaged energy height z + v^2/(2g) against the mass-averaged horizontal
@@ -334,7 +388,8 @@ private:
     /// Builds the bind group unless the cached one still refers to the current resources.
     void ensure_bind_group(const webgpu::raii::TextureWithSampler& height_texture, const webgpu::raii::TextureWithSampler& release_point_texture);
     void create_pipelines(WGPUDevice device, const webgpu::RenderResourceRegistry& reg);
-    void update_gpu_settings(const radix::geometry::Aabb<2, double>& region_aabb, const webgpu::raii::TextureWithSampler& height_texture);
+    void update_gpu_settings(
+        const radix::geometry::Aabb<2, double>& region_aabb, const webgpu::raii::TextureWithSampler& height_texture, const SandboxTerrain* sandbox);
     void write_initial_state();
     /// Zeroes the per-run counters (max speed, plastic particles) without touching the
     /// terrain scan or the seed count.
@@ -366,6 +421,7 @@ private:
     std::unique_ptr<webgpu::raii::RawBuffer<uint32_t>> m_density_buffer;
     std::unique_ptr<webgpu::raii::RawBuffer<uint32_t>> m_grid_velocity_buffer; // vec4f per node
     std::unique_ptr<webgpu::raii::RawBuffer<uint32_t>> m_tile_flag_buffer; // u32 per tile of columns
+    std::unique_ptr<webgpu::raii::RawBuffer<uint32_t>> m_column_peak_buffer; // ColumnStats per (x, y) column
     std::unique_ptr<webgpu::raii::TextureWithSampler> m_output_texture;
     std::unique_ptr<webgpu::raii::BindGroup> m_bind_group;
 
@@ -374,6 +430,7 @@ private:
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_p2g_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_grid_update_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_g2p_pipeline;
+    std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_column_stats_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_refresh_stress_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_splat_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_rasterize_pipeline;
@@ -408,6 +465,7 @@ private:
     bool m_run_first_chunk = true;
     bool m_run_is_reset = false;
     bool m_run_refresh_stress = false; // material edited without a reseed, see mpm_refresh_stress.wgsl
+    bool m_run_column_stats = false; // sum particle speeds per column (peak velocity), sandbox only
     /* The uniform fields the cached particle stress depends on, as of the last run. */
     std::array<float, 11> m_stress_parameters {};
     bool m_readback_in_flight = false; // m_state_readback is being mapped - skip this run's copy
@@ -427,8 +485,12 @@ private:
     std::array<bool, TIMESTAMP_SLOTS> m_timestamp_busy {};
     uint32_t m_chunk_counter = 0;
     std::chrono::steady_clock::time_point m_run_started;
+    std::chrono::steady_clock::time_point m_reset_wall_start = std::chrono::steady_clock::now();
     PerfStats m_perf;
     SimStateReadback m_last_state;
+    float m_peak_mean_speed_sq = 0.0f; // since the reset, for the stop criterion
+    BoundaryContacts m_contacts_since_reset;
+    bool m_at_rest = false;
     std::vector<EnergySample> m_energy_line;
 };
 

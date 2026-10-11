@@ -9,12 +9,12 @@ which is why one bind group layout and one bind group serve all of them.
 One node execution, all inside a **single compute pass**:
 
 ```
-[buffer clear] density_raster; on reset also grid + tile_flags     (outside the pass)
+[buffer clear] density_raster; on reset also grid, tile_flags, column_stats   (outside the pass)
 begin compute pass                                                  (one per chunk)
   if reset:  mpm_prepare  →  mpm_seed
   else if a stress parameter changed since the last run:  mpm_refresh_stress
   repeat substeps_per_submit times:
-      mpm_p2g → mpm_grid_update → mpm_g2p
+      mpm_p2g → mpm_grid_update → mpm_g2p  [→ mpm_column_stats, sandbox only]
   last chunk: mpm_splat → mpm_rasterize
 end pass
 last chunk: copy state → readback buffer
@@ -35,7 +35,8 @@ follows the snow instead of the domain. See [09-performance-analysis.md](09-perf
 ```
 0  uniform    MpmSettings
 1  texture    height_texture           R32Float, unfilterable
-2  texture    release_point_texture    RGBA8Unorm, alpha > 0 marks a release cell
+2  texture    release_point_texture    RGBA8Unorm, alpha > 0 marks a release cell (map);
+                                       R32Float release depth (sandbox) - layout unfilterable-float
 3  storage    particles      array<Particle>       read_write
 4  storage    grid           array<GridNode>       read_write, atomic<i32>
 5  storage    state          SimState              read_write, atomics
@@ -44,6 +45,7 @@ follows the snow instead of the domain. See [09-performance-analysis.md](09-perf
 8  storage    column_floor   array<i32>            read_write (written by prepare)
 9  storage    grid_velocity  array<vec4f>          read_write (grid update → G2P)
 10 storage    tile_flags     array<atomic<u32>>    read_write (P2G → grid update)
+11 storage    column_stats   array<ColumnStats>    read_write (peaks; column_stats → grid update)
 ```
 
 Unused bindings in a given kernel are fine; the reverse (using something not in the layout)
@@ -96,7 +98,17 @@ clamped onto its wall immediately). Then requires a release-point-texture hit un
 the share of the disc that holds snow — the seeded area, from which
 `seeded_particle_volume()` gets the real volume per particle (Voellmy depth).
 
-Particle z = terrain height + `rand · slab_thickness`, so the slab has real depth.
+**Sandbox (`release_mode = RELEASE_GRID`).** The release texture holds the vertical release
+depth per DEM cell (AvaFrame's slope-normal thickness / cos slope). Samples are uniform over
+the bounds of the release cells (centre `release_centre`, half extents `release_radius`,
+`release_half_y`). A sample is kept with probability depth / `release_max_depth`, so particles
+per area follow the depth and all stand for the same volume:
+`seeded_particle_volume()` = `release_volume` / active particles. There are up to 256 attempts,
+because the cells can fill a small share of their bounds (avaMal's three areas). `seed_anywhere`
+does not apply.
+
+Particle z = terrain height + `rand · slab_thickness` (the cell's depth in the sandbox), so
+the slab has real depth.
 Initialised with `F = I`, `C = 0`, `plastic_state = material_initial_state()` (Jp = 1 for
 Stomakhin — the initial state is model-dependent, which is why it is a dispatcher call).
 
@@ -162,6 +174,29 @@ if world.z < terrain_height(world.xy):
 
 Nodes outside flagged tiles are never visited: their accumulators are still zero from the
 last time they were consumed, and no particle's stencil reads their velocity this substep.
+
+**Peaks (2026-10-10, AvaFrame comparison).** After the layer loop the thread updates its
+column's `ColumnStats`:
+- `peak_depth = max(·, column mass / particle mass · seeded_particle_volume() / dx²)`, the same
+  depth Voellmy uses;
+- `peak_speed = max(·, speed_sum / particles)`, the mean speed of the particles that
+  `mpm_column_stats` counted in this column after the previous G2P. The sums are then zeroed.
+
+The speed is particle-based on purpose. In MLS-MPM a node's P2G momentum includes the stress
+impulse. At the edge of the flow, on nodes with almost no mass, momentum / mass (or the updated
+grid velocity) reached 234 m/s on avaKot, where no particle exceeded 101 m/s.
+
+## `mpm_column_stats` — 256×1×1, over particles (sandbox only)
+
+Each particle adds 1 and its speed (cm/s) to the `ColumnStats` of its nearest node's column.
+That column lies inside its stencil, so the next P2G marks the tile and the grid update visits it.
+It runs after G2P, and only while the `sandbox` input is connected.
+
+It is a separate pass because the same two atomics placed in P2G changed nothing the physics
+reads, yet they changed how the compiler arranged P2G's float arithmetic. The benchmark trace
+then drifted by 2 mm in 10 s, deterministically, and returned when the atomics came out.
+Separate, the diagnostics cannot touch the solver: the benchmark trace is bit-identical to
+the version without peaks.
 
 ## `mpm_g2p` — 256×1×1, over particles
 

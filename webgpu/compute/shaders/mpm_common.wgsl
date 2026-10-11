@@ -79,7 +79,17 @@ struct MpmSettings {
     ccc_beta: f32, // Cam-Clay: cohesion, tensile strength = beta p0
     ccc_xi: f32, // Cam-Clay: hardening factor (brittleness)
     ccc_p0_initial: f32, // Cam-Clay: initial consolidation pressure [Pa]
+
+    release_mode: u32, // RELEASE_DISC or RELEASE_GRID, see mpm_seed.wgsl
+    release_volume: f32, // [m^3], RELEASE_GRID only
+    release_max_depth: f32, // [m], RELEASE_GRID only
+    release_half_y: f32, // half height of the release bounds [m]; release_radius is the half width
 }
+
+// Release disc masked by the release point texture (alpha) - the map.
+const RELEASE_DISC: u32 = 0u;
+// Release depth per cell in the release texture (r, metres, vertical) - the AvaFrame sandbox.
+const RELEASE_GRID: u32 = 1u;
 
 // The six scalars in the vec3 padding hold the Kirchhoff stress tau = P F^T of the particle's
 // current elastic state (symmetric for every model here, so six components). G2P computes it
@@ -194,6 +204,10 @@ const SUM_PATH_SCALE: f32 = 1.0e5; // 0.01 mm
 // the seeded area times its thickness, the area being the release disc times the share of
 // first seeding samples that hit a release point (Monte Carlo over every seeding thread).
 fn seeded_particle_volume() -> f32 {
+    // The sandbox knows its release volume exactly (AvaFrame's thickness times surface area).
+    if settings.release_mode == RELEASE_GRID {
+        return settings.release_volume / max(f32(atomicLoad(&state.active_particles)), 1.0);
+    }
     let hit_share = f32(atomicLoad(&state.seed_first_hits)) / f32(max(settings.num_particles, 1u));
     let area = hit_share * 3.14159265 * settings.release_radius * settings.release_radius;
     return area * settings.slab_thickness / max(f32(atomicLoad(&state.active_particles)), 1.0);
@@ -218,6 +232,20 @@ struct PlasticReturn {
 @group(0) @binding(8) var<storage, read_write> column_floor: array<i32>; // per (x, y) column, see grid_slot()
 @group(0) @binding(9) var<storage, read_write> grid_velocity: array<vec4f>; // per node, written by the grid update, read by G2P
 @group(0) @binding(10) var<storage, read_write> tile_flags: array<atomic<u32>>; // per tile of columns, see mark_tiles()
+// Per (x, y) column: the peaks since the last reset, which the AvaFrame comparison exports
+// (com1DFA's peak flow thickness and velocity), and the particle sums the speed comes from.
+// mpm_column_stats adds every particle to the column of its nearest node after G2P; the next
+// grid update, which owns each column in one thread, turns the sums into the column's mean
+// particle speed and zeroes them. Without that pass (on the map) the sums stay zero and only
+// the depth is tracked.
+struct ColumnStats {
+    peak_depth: f32, // [m], vertical: the column's (B-spline) mass as snow volume per area
+    peak_speed: f32, // [m/s], mean speed of the particles in the column
+    particles: atomic<u32>, // this substep
+    speed_sum: atomic<u32>, // this substep, [SPEED_SUM_SCALE]
+}
+const SPEED_SUM_SCALE: f32 = 100.0; // cm/s; 2^21 particles at 20 m/s still fit a u32
+@group(0) @binding(11) var<storage, read_write> column_stats: array<ColumnStats>;
 
 // ---------------------------------------------------------------------------------------
 // Fixed point helpers

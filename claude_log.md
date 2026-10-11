@@ -25,7 +25,212 @@ Mercator-corrected release mask (30–45°): 25.3–27.3° on all three scenario
 cos(latitude of the region centre); domain box converted back for the map; panel readout from
 the node's metric domain size. **Measured after:** 35.0–37.4°. Probe removed. Doc: 04 (coordinate
 conventions), 06 §4k, 01 §5, 05. **Consequence:** all earlier real-terrain results ran on
-flattened slopes; Dachstein now produces band-ceiling contacts on its cliffs. Not committed.
+flattened slopes; Dachstein now produces band-ceiling contacts on its cliffs. PR #6.
+
+### 2. AvaFrame comparison, phase 1: dataset preparation (branch `avaframe-comparison`)
+
+The plan (in Notion) compares the MPM solver with AvaFrame com1DFA on AvaFrame's own test
+cases. Phase 1 makes those cases usable: `mpm-mls-doc/avaframe/prepare_dataset.py` reads a
+pinned sparse clone of AvaFrame 2.1 (`extern/avaframe`, git-ignored). It writes, per dataset, to
+`extern/avaframe_sandbox/`:
+- the DEM;
+- the release thickness rasters;
+- the com1DFA benchmark peak rasters (pft/pfv/ppr);
+- the AIMEC path;
+- a preview PNG;
+- for real terrain, EPSG:3857 PNG overlays with `_aabb.txt` sidecars for the Overlays panel.
+
+It needs only numpy and pyproj: shapefile, dBASE, ASCII-grid and PNG I/O are hand-written.
+The tool's README has the dataset table and the conventions.
+
+**Decisions.**
+- **Release thickness is slope-normal**, so the volume is Σ t·A / cos(slope). Treating it as
+  vertical made avaKot 30 % light.
+- **References stay on com1DFA's own 5 m grid**, because it remeshes. They are not
+  resampled onto the DEM.
+- **Geolocate only if the DEM centre lies inside the CRS's area of use.** The synthetic
+  datasets ship the same Austria Lambert `.prj` with local coordinates, which would place
+  them off Liguria.
+- **GeoTIFF datasets are skipped** (avaAlr, avaFlowPy, avaMalRegional, scarpExample).
+
+**Verified:**
+- `--all` runs (23 datasets prepared, 4 skipped).
+- avaKot release volume is 21 681 m³ against com1DFA's logged 21 640 m³.
+- The avaKot preview matches AvaFrame's own plot of footprint and path.
+- The overlay sidecar matches the parser in `nucleus/utils/geopng_decoder.cpp`.
+- Real datasets land at 47.0–47.3° N, 10.3–11.7° E.
+
+**Not verified:** overlay alignment on the map in the app.
+
+**Not done:** phases 2–6 (sandbox terrain node, MPM peak rasters, display, AIMEC, model
+comparison).
+
+### 4. AvaFrame comparison, phase 2: the sandbox in the app
+
+PR #6 (`mpm-metric-units`) was merged into this branch first, because the sandbox needs the
+solver in metres. Then:
+- **`AvaFrameSandboxNode`** loads a prepared dataset: DEM, release, and the com1DFA footprint
+  resampled onto the DEM.
+- **`MpmSolverNode`** gets an optional `sandbox` input. When it is connected:
+  - the region is in metres;
+  - the domain is centred on release plus reference footprint;
+  - seeding uses rejection sampling by release depth per cell (`release_mode = 1`);
+  - the volume per particle is the exact release volume divided by the active particles.
+- The uniform grows from 176 to 192 B; the benchmark is updated to match.
+- The release binding is now `unfilterable-float`, so it accepts both RGBA8 and R32Float.
+- The **SandboxView** window and the panel's dataset picker, plus startup keys for running
+  straight into a dataset.
+
+**Decisions.**
+- **NODATA filled as a plateau, not walls.** A wall would exceed the terrain-following band's
+  step limit.
+- **The suggested domain decides the size and the cell size:** dx = max(DEM cell, size/512).
+- **No first-run notice for the sandbox preset.**
+
+**Verified:**
+- WGSL validator and the macOS build.
+- avaKot/relKot with Li V parameters runs end to end:
+  - all 65 536 particles seeded, release volume 21 681 m³;
+  - 85 s simulated in about 65 s;
+  - the centre of mass moves north as in AvaFrame's plot;
+  - screenshot of the 2D view checked.
+- Benchmark in the browser pane, this tree against HEAD: identical physics trace and GPU time
+  (the disc path is unchanged).
+- The map scenario runs without validation errors.
+
+**Not verified:**
+- The headless CDP benchmark script returned zeros on both trees. It is a harness problem,
+  because the browser pane works.
+- The web and iOS builds of the new files (no sandbox folder there by default).
+
+### 5. AvaFrame comparison, phase 3: peak rasters, stop rule, export
+
+- **Peaks per grid column** (`ColumnStats`, binding 11): depth from the column's mass, as for
+  Voellmy, and speed from the mean speed of the particles in the column.
+- **Stop rule** `at_rest()`: kinetic energy below 1 % of its peak, the benchmarks' "< 1.00
+  percent of PKE". The panel pauses there.
+- **Export** `write_sandbox_result`: pft (slope-normal), pfv and ppr (ρv²) on the DEM grid,
+  with the DEM header, in `<dataset>/mpm/<time>_<release>/`, plus params.json.
+
+**Two problems found and fixed on the way:**
+1. **Grid velocity is the wrong speed.** Using the node momentum, or the updated grid velocity,
+   gave up to 234 m/s at the flow's edge, where columns hold almost no mass and the MLS-MPM
+   stress impulse dominates. The fastest particle was 101 m/s. Gating by peak depth did not
+   help, because depth and speed peaks happen at different times. Now particle-based.
+2. **Two atomics in P2G changed the physics trace.** They shifted it by 2 mm after 10 s,
+   deterministically. Bisected in the benchmark: without the atomics the trace is
+   bit-identical, and with them it differs even when they add a constant. That is the
+   compiler's float arrangement, not data flow. They moved to a separate `mpm_column_stats`
+   pass that runs only in the sandbox; the trace is bit-identical again and the GPU time
+   unchanged.
+
+**Verified:**
+- avaKot: at rest after 95 s. Max pft 13.4 m (com1DFA 5.9 m), max pfv 104.5 m/s (39.7). The
+  speed is right for Coulomb friction without drag.
+- avaKot with pft > 0.1 m: 97 % of the reference cells covered, 64 % of the MPM cells inside
+  the reference.
+- avaGar: at rest after 116 s; 88 % covered, 79 % inside. The 35 m maximum sits at the gully
+  constriction where com1DFA also peaks (12.3 m).
+- Export headers equal the DEM's.
+- Benchmark bit-identical to phase 2.
+
+### 6. AvaFrame comparison, phase 4: display
+
+- **2D view layers:** live particles; MPM peak pft, pfv and ppr; com1DFA pft, pfv and ppr.
+  One colour scale for MPM and com1DFA, a legend, values under 0.1 m faint, and a hover table
+  with MPM against com1DFA at the cell.
+- **The sandbox node now loads all three reference rasters.**
+- **Map overlay for real datasets.** An affine fit to the DEM corners, resampled into a
+  world-aligned texture, through an `OverlayRenderNode`. That node gets a `trim_stitch_edge`
+  switch, because its trim is for stitched tiles only. The texture is never null, since
+  `TextureOverlay::render` asserts on it; synthetic datasets get 1x1 transparent.
+- The camera flies to real datasets, wired to the controller like the search panel.
+- The view's layer and visibility are stored per user.
+
+**Verified:**
+- Screenshot of the 2D peak layer with legend and hover table.
+- Screenshot of the overlay on the map at the Lechtal: the fan sits at the slope foot.
+- Affine placement against pyproj's exact transformation over each real DEM: ≤ 0.49 m,
+  mean 0.1–0.2 m.
+
+**Process note:**
+- Screenshots now capture only the app window, matched by process ID. A full-screen capture had
+  caught another window, and the first by-name match hit the user's own webgpu_app instance.
+- Test runs now back up and restore the user's app preferences and imgui.ini. They had
+  overwritten startup preset, location and pacing; those were restored by hand.
+
+### 7. AvaFrame comparison, phase 5: AIMEC rating and batch mode
+
+- AvaFrame 2.1 installed in `.venv-avaframe`. It needs Python < 3.14 and Homebrew has only
+  3.14, so the venv uses the system Python 3.9.6; nothing installed system-wide.
+- `compare_aimec.py` builds one AvaFrame avalanche directory per run: dataset inputs, the
+  benchmark as module com1DFA, the MPM as module mpm. It runs AvaFrame's module comparison with
+  the benchmark's own AIMEC configuration, in two threshold variants (ppr > 1 kPa,
+  pft > 0.1 m), and writes `aimec.json`.
+- Batch mode via `WEBIGEO_SANDBOX_BATCH`. Each run is exported with its label; the app writes a
+  results file and quits without touching the preferences (checked by comparing the plist).
+  `params.json` gains wall time and GPU time.
+
+**Pitfall caught:** AIMEC's `deltaSXY` is each result's own length along the path, not the runout
+difference. The first version reported 1767 m "difference". It is now sRunout(MPM) −
+sRunout(com1DFA), and the area indicators are labelled as runout-area only.
+
+**Verified:**
+- AIMEC runs on avaKot. Its comparison plot shows MPM ⊇ reference with lateral spread.
+- The batch reproduces the manual run exactly.
+- Voellmy (com1DFA's mu 0.155, xi 4000) runs further than Coulomb on avaKot: +291 m against
+  +198 m (ppr).
+
+### 8. AvaFrame comparison, phase 6: models compared
+
+- **com4FlowPy** through AvaFrame (`run_com4flowpy.py`).
+- **weBIGeo trajectory model** in the sandbox: a new preset, a release mask from the sandbox node,
+  `export_trajectories`, and the batch `"model": "trajectories"`.
+- **35-run batch** (`batch_phase6.json`). `summarise.py` runs AIMEC and writes the tables, and
+  `11-avaframe-comparison.md` holds the write-up.
+
+**Two measurement problems found and fixed before reporting:**
+1. **Runs cut off by the MPM box.** Different models ended at exactly the same runout per
+   dataset. The suggested domain (com1DFA footprint + 15 %) stopped them. Rerun on the whole DEM;
+   runs now record their wall contacts, which are 0–0.1 %.
+2. **Runs reaching the end of the AIMEC path.** A remaining identical value turned out to be the
+   end of AvaFrame's path. compare_aimec records the path length and marks such runouts "≥"
+   (lower bound).
+
+**Result** (pft > 0.1 m, five avalanches):
+- **Cam Clay with Li V parameters and Coulomb is closest.** Mean |Δrunout| 135 m, |Δangle| 1.5°.
+- **Every Coulomb variant except Stomakhin is about 2–2.5× too fast.**
+- **Voellmy with com1DFA's μ 0.155 / ξ 4000 runs too far for every material.** Open: the flow
+  depth the drag uses.
+- **Stomakhin's film snow stops early on the long avalanches.**
+- **The trajectory model is good where com1DFA's angle is near its α of 25°** and overshoots
+  elsewhere.
+- **com4FlowPy, on all five after the PR (11–146 min each):** mean 186 m and 2.5°. It sits
+  between the trajectory model and the best MPM variant.
+
+### 3. iOS build (PR #5, merged) — log entry added after the fact
+
+webgpu_app runs on an iPhone 17 Pro Max. The build uses:
+- Qt 6.11.1 iOS through aqt;
+- Dawn built from source for Metal, with a BC-format patch in `UtilsMetal.mm`;
+- static SDL2;
+- the Xcode generator.
+
+The fixes needed on the device were:
+- a UIScene manifest;
+- `SDL_Metal_CreateView` for rotation;
+- a smaller cloud atlas against the jetsam memory kill;
+- a repaint after resize, so the map is not black after a screenshot;
+- safe-area insets;
+- a UI scale of 0.75.
+
+Documented in `docs/webgpu_app_ios.md`.
+
+**Open:**
+- 3× resolution;
+- pinch zoom;
+- whether the top menu is reachable with the safe-area fix (not confirmed on the device);
+- replacing the temporary `TEMP-IOS-DIAG` log.
 
 ## 2026-10-03
 

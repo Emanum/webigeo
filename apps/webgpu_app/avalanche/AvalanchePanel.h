@@ -18,8 +18,11 @@
 
 #pragma once
 
+#include "SandboxView.h"
 #include "ui/ImGuiPanel.h"
 
+#include <QJsonArray>
+#include <QJsonObject>
 #include <chrono>
 #include <glm/glm.hpp>
 #include <string>
@@ -27,6 +30,7 @@
 
 namespace webgpu_compute::nodes {
 class MpmSolverNode;
+class AvaFrameSandboxNode;
 class GeoRegionNode;
 class SelectTilesNode;
 class Node;
@@ -121,6 +125,10 @@ public:
     void draw() override;
     void draw_panel() override;
 
+signals:
+    /// "Show on the map" for a geolocated sandbox dataset; connected to the camera controller.
+    void fly_to_requested(double latitude, double longitude);
+
 private:
     /// Looks up the solver in the currently loaded graph. Returns nullptr if the active
     /// graph has no MPM node. Re-resolved every frame because loading a preset replaces
@@ -150,6 +158,46 @@ private:
     void apply_pacing(webgpu_compute::nodes::MpmSolverNode& solver);
     void draw_performance(webgpu_compute::nodes::MpmSolverNode& solver);
 
+    /// AvaFrame sandbox (see AvaFrameSandboxNode): datasets prepared by
+    /// mpm-mls-doc/avaframe/prepare_dataset.py, listed from <root>/index.json.
+    struct SandboxDataset {
+        std::string name;
+        std::vector<std::string> scenarios;
+        bool geolocated = false;
+        bool has_reference = false;
+    };
+    void scan_sandbox_datasets();
+    /// Loads the sandbox graph preset and the selected dataset.
+    void load_sandbox();
+    /// Points the sandbox node at the selected dataset and scenario and runs the graph.
+    bool apply_sandbox_dataset();
+    /// Once the sandbox node has loaded a dataset: domain size and grid from its suggestion,
+    /// reseed. The suggestion needs the loaded data, so this runs after the graph, not before.
+    void configure_sandbox_solver(const webgpu_compute::nodes::AvaFrameSandboxNode& sandbox, webgpu_compute::nodes::MpmSolverNode& solver);
+    void draw_sandbox_section(webgpu_compute::nodes::AvaFrameSandboxNode& sandbox);
+    /// Reads the solver's peak rasters back and writes them next to the dataset
+    /// (write_sandbox_result). Asynchronous; the outcome lands in m_sandbox_status.
+    void export_sandbox_result(const std::string& stopped_by);
+
+    /// Batch mode (WEBIGEO_SANDBOX_BATCH=<jobs.json>, see mpm-mls-doc/avaframe/README.md): runs a
+    /// list of sandbox runs one after the other, each to rest or to its time limit, exports each
+    /// with its label, writes <jobs>.results.json and optionally quits. Never touches the stored
+    /// user preferences.
+    struct BatchRun {
+        std::string label;
+        std::string dataset;
+        std::string scenario; // empty = the dataset's first
+        std::string material_preset; // preset name; empty = keep the current material
+        QJsonObject settings; // solver settings to override, keys as in MpmSolverNode::serialize_settings
+        float max_time = 400.0f; // [s] simulated; com1DFA's default tEnd
+        bool trajectories = false; // "model": "trajectories" - the weBIGeo trajectory model instead of the MPM
+    };
+    enum class BatchPhase { Idle, Loading, Running, Exporting, Done };
+    bool load_batch(const QString& path);
+    void start_batch_run();
+    void batch_tick();
+    void finish_batch();
+
 private:
     NodeGraphPanel* m_graph_panel;
     bool m_playing = false;
@@ -166,6 +214,28 @@ private:
     int m_selected_material_preset = 0; // 0 = custom (no preset active)
 
     Pacing m_pacing = Pacing::Balanced;
+
+    bool m_startup_sandbox = false; // autostart loads the sandbox instead of the map
+    std::string m_sandbox_root;
+    std::vector<SandboxDataset> m_sandbox_datasets;
+    std::string m_sandbox_scan_error;
+    int m_sandbox_dataset = 0;
+    int m_sandbox_scenario = 0;
+    std::string m_sandbox_configured; // "dataset/scenario" the solver was last sized for
+    bool m_sandbox_auto_export = false; // export the peak rasters when the flow comes to rest
+    bool m_sandbox_stopped = false; // this run has come to rest (paused once, exported once), until the next reset
+    float m_sandbox_last_time = 0.0f; // simulated time last frame; going back means a reset
+    std::string m_sandbox_status;
+    std::string m_last_export; // directory of the last finished export, or "error: ..."
+
+    QString m_batch_file;
+    std::vector<BatchRun> m_batch;
+    size_t m_batch_index = 0;
+    BatchPhase m_batch_phase = BatchPhase::Idle;
+    bool m_batch_quit = true;
+    QJsonArray m_batch_results;
+    std::chrono::steady_clock::time_point m_batch_run_started;
+    SandboxView m_sandbox_view;
 
     /* Simulated seconds per wall-clock second, measured over ~1 s windows while playing. */
     std::chrono::steady_clock::time_point m_speed_window_start;

@@ -26,11 +26,21 @@
 #else
 #include <QSettings>
 #endif
+#include <QDir>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <imgui.h>
 #include <algorithm>
 #include <cmath>
 #include <nucleus/srs.h>
 #include <webgpu/compute/NodeGraph.h>
+#include <QJsonObject>
+#include <SDL2/SDL.h>
+#include <cstdlib>
+#include <webgpu/compute/nodes/AvaFrameSandboxNode.h>
+#include <webgpu/compute/nodes/ComputeAvalancheTrajectoriesNode.h>
 #include <webgpu/compute/nodes/GeoRegionNode.h>
 #include <webgpu/compute/nodes/MpmSolverNode.h>
 #include <webgpu/compute/nodes/SelectTilesNode.h>
@@ -75,6 +85,16 @@ AvalanchePanel::AvalanchePanel(NodeGraphPanel* graph_panel)
 
 namespace {
 constexpr const char* MPM_GRAPH_PRESET = ":/graphs/mpm_avalanche_simulation.json";
+constexpr const char* SANDBOX_GRAPH_PRESET = ":/graphs/mpm_avaframe_sandbox.json";
+constexpr const char* TRAJECTORIES_SANDBOX_GRAPH_PRESET = ":/graphs/trajectories_avaframe_sandbox.json";
+
+// Where prepare_dataset.py writes the sandbox datasets. Native builds from a source tree only;
+// elsewhere the folder has to be entered in the panel.
+#ifdef ALP_SOURCE_DIR
+constexpr const char* DEFAULT_SANDBOX_ROOT = ALP_SOURCE_DIR "/extern/avaframe_sandbox";
+#else
+constexpr const char* DEFAULT_SANDBOX_ROOT = "";
+#endif
 
 // Particles per cell are far above the 8 of Li et al. 2021 at every level (a 100 m release
 // disc at 12.5 m cells is ~200 columns), so fewer particles mostly thin the rendered cloud
@@ -129,11 +149,35 @@ void AvalanchePanel::load_startup_settings()
     m_pacing = Pacing(std::clamp(settings.value("playback/pacing", int(Pacing::Balanced)).toInt(), 0, int(Pacing::Fast)));
     m_selected_scenario = std::clamp(settings.value("startup/scenario", 0).toInt(), 0, int(m_scenarios.size()) - 1);
     m_selected_material_preset = std::clamp(settings.value("startup/material_preset", 0).toInt(), 0, int(m_material_presets.size()) - 1);
+    m_startup_sandbox = settings.value("startup/sandbox", false).toBool();
+    m_sandbox_root = settings.value("sandbox/root", QString(DEFAULT_SANDBOX_ROOT)).toString().toStdString();
+    m_sandbox_auto_export = settings.value("sandbox/auto_export", false).toBool();
+    m_sandbox_view.set_layer(SandboxView::Layer(std::clamp(settings.value("sandbox/view_layer", 0).toInt(), 0, int(SandboxView::Layer::RefPressure))));
+    m_sandbox_view.open = settings.value("sandbox/view_open", true).toBool();
+#endif
+    if (m_sandbox_root.empty())
+        m_sandbox_root = DEFAULT_SANDBOX_ROOT;
+    scan_sandbox_datasets();
+#ifndef __EMSCRIPTEN__
+    // Restore the dataset by name: the list may have changed since.
+    const std::string dataset = settings.value("sandbox/dataset").toString().toStdString();
+    const std::string scenario = settings.value("sandbox/scenario").toString().toStdString();
+    for (size_t i = 0; i < m_sandbox_datasets.size(); i++) {
+        if (m_sandbox_datasets[i].name != dataset)
+            continue;
+        m_sandbox_dataset = int(i);
+        const auto& scenarios = m_sandbox_datasets[i].scenarios;
+        m_sandbox_scenario = int(std::find(scenarios.begin(), scenarios.end(), scenario) - scenarios.begin());
+        if (m_sandbox_scenario >= int(scenarios.size()))
+            m_sandbox_scenario = 0;
+    }
 #endif
 }
 
 void AvalanchePanel::save_startup_settings() const
 {
+    if (m_batch_phase != BatchPhase::Idle)
+        return; // a batch must not change what the user has stored
 #ifndef __EMSCRIPTEN__
     QSettings settings(SETTINGS_ORGANISATION, SETTINGS_APPLICATION);
     settings.setValue("startup/autostart", m_autostart);
@@ -141,14 +185,39 @@ void AvalanchePanel::save_startup_settings() const
     settings.setValue("startup/scenario", m_selected_scenario);
     settings.setValue("startup/material_preset", m_selected_material_preset);
     settings.setValue("playback/pacing", int(m_pacing));
+    settings.setValue("startup/sandbox", m_startup_sandbox);
+    settings.setValue("sandbox/root", QString::fromStdString(m_sandbox_root));
+    settings.setValue("sandbox/auto_export", m_sandbox_auto_export);
+    settings.setValue("sandbox/view_layer", int(m_sandbox_view.layer()));
+    settings.setValue("sandbox/view_open", m_sandbox_view.open);
+    if (m_sandbox_dataset < int(m_sandbox_datasets.size())) {
+        const auto& dataset = m_sandbox_datasets[size_t(m_sandbox_dataset)];
+        settings.setValue("sandbox/dataset", QString::fromStdString(dataset.name));
+        if (m_sandbox_scenario < int(dataset.scenarios.size()))
+            settings.setValue("sandbox/scenario", QString::fromStdString(dataset.scenarios[size_t(m_sandbox_scenario)]));
+    }
 #endif
 }
 
 void AvalanchePanel::ready()
 {
     load_startup_settings();
+#ifndef __EMSCRIPTEN__
+    if (const char* batch = std::getenv("WEBIGEO_SANDBOX_BATCH"); batch != nullptr && *batch != '\0') {
+        if (load_batch(QString::fromUtf8(batch)))
+            start_batch_run();
+        return;
+    }
+#endif
     if (!m_autostart)
         return;
+    if (m_startup_sandbox) {
+        load_sandbox();
+        if (m_selected_material_preset > 0)
+            apply_material_preset(m_material_presets[size_t(m_selected_material_preset)]);
+        m_autoplay_pending = m_autoplay;
+        return;
+    }
     m_graph_panel->load_preset(MPM_GRAPH_PRESET);
     // Material first: it only writes solver settings. The scenario then writes the
     // remaining ones and runs the graph, which fetches the terrain and seeds.
@@ -261,8 +330,435 @@ void AvalanchePanel::apply_material_preset(const MaterialPreset& preset)
     solver->set_settings(s);
 }
 
+void AvalanchePanel::scan_sandbox_datasets()
+{
+    m_sandbox_datasets.clear();
+    m_sandbox_scan_error.clear();
+    QFile index(QDir(QString::fromStdString(m_sandbox_root)).filePath("index.json"));
+    if (m_sandbox_root.empty() || !index.open(QIODevice::ReadOnly)) {
+        m_sandbox_scan_error = "No index.json in the sandbox folder - run mpm-mls-doc/avaframe/prepare_dataset.py --all.";
+        return;
+    }
+    for (const auto& value : QJsonDocument::fromJson(index.readAll()).object()["datasets"].toArray()) {
+        const QJsonObject entry = value.toObject();
+        SandboxDataset dataset;
+        dataset.name = entry["name"].toString().toStdString();
+        for (const auto& scenario : entry["release_scenarios"].toArray())
+            dataset.scenarios.push_back(scenario.toString().toStdString());
+        dataset.geolocated = entry["location"].isArray();
+        dataset.has_reference = !entry["references"].toArray().isEmpty();
+        if (!dataset.scenarios.empty())
+            m_sandbox_datasets.push_back(std::move(dataset));
+    }
+    // Real terrain with a com1DFA reference first: those are the comparison cases.
+    std::stable_sort(m_sandbox_datasets.begin(), m_sandbox_datasets.end(), [](const SandboxDataset& a, const SandboxDataset& b) {
+        return (a.geolocated && a.has_reference) > (b.geolocated && b.has_reference);
+    });
+    m_sandbox_dataset = std::clamp(m_sandbox_dataset, 0, std::max(int(m_sandbox_datasets.size()) - 1, 0));
+}
+
+void AvalanchePanel::load_sandbox()
+{
+    m_graph_panel->load_preset(SANDBOX_GRAPH_PRESET);
+    m_sandbox_configured.clear();
+    m_startup_sandbox = true;
+    save_startup_settings();
+    m_scenario_error = apply_sandbox_dataset() ? std::string {} : std::string { "Could not load the sandbox dataset." };
+}
+
+bool AvalanchePanel::apply_sandbox_dataset()
+{
+    auto* graph = m_graph_panel->node_graph();
+    auto* sandbox = find_node<nodes::AvaFrameSandboxNode>();
+    if (graph == nullptr || sandbox == nullptr || m_sandbox_dataset >= int(m_sandbox_datasets.size()))
+        return false;
+    const auto& dataset = m_sandbox_datasets[size_t(m_sandbox_dataset)];
+    auto settings = sandbox->get_settings();
+    settings.dataset_path = QDir(QString::fromStdString(m_sandbox_root)).filePath(QString::fromStdString(dataset.name)).toStdString();
+    settings.release_scenario = dataset.scenarios[size_t(std::clamp(m_sandbox_scenario, 0, int(dataset.scenarios.size()) - 1))];
+    sandbox->set_settings(settings);
+    if (auto* solver = find_solver())
+        solver->request_reset();
+    m_playing = false;
+    graph->run();
+    return true;
+}
+
+void AvalanchePanel::configure_sandbox_solver(const nodes::AvaFrameSandboxNode& sandbox, nodes::MpmSolverNode& solver)
+{
+    const nodes::SandboxTerrain* terrain = sandbox.terrain();
+    if (terrain == nullptr)
+        return;
+    const std::string key = terrain->dataset_path + "/" + terrain->scenario;
+    if (key == m_sandbox_configured || solver.is_running())
+        return;
+    m_sandbox_configured = key;
+
+    // Domain from the dataset's suggestion (release plus com1DFA footprint, with a margin),
+    // cells as fine as the DEM where the grid limit allows: 5 m cells reach 2.56 km.
+    auto settings = solver.get_settings();
+    const double size = std::ceil(terrain->suggested_domain_size / 10.0) * 10.0;
+    const double dx = std::max(terrain->cellsize, size / double(nodes::MpmSolverNode::MAX_GRID_RESOLUTION_XY));
+    settings.domain_size_xy = float(size);
+    settings.grid_resolution_xy = std::clamp(uint32_t(std::ceil(size / dx)), 64u, nodes::MpmSolverNode::MAX_GRID_RESOLUTION_XY);
+    settings.splat_radius = float(dx);
+    const float cfl_dt = nodes::MpmSolverNode::max_stable_dt(settings, float(size) / float(settings.grid_resolution_xy));
+    if (settings.dt > cfl_dt)
+        settings.dt = 0.8f * cfl_dt;
+    settings.reset_on_next_run = true;
+    solver.set_settings(settings);
+    m_sandbox_stopped = false;
+    m_sandbox_status.clear();
+    if (solver.has_valid_inputs())
+        solver.rerun();
+    // A real dataset also shows on the map (AvaFrameSandboxNode::update_map_overlay): go there.
+    if (terrain->centre_lat_lon)
+        emit fly_to_requested(terrain->centre_lat_lon->x, terrain->centre_lat_lon->y);
+}
+
+void AvalanchePanel::export_sandbox_result(const std::string& stopped_by)
+{
+    auto* solver = find_solver();
+    auto* sandbox = find_node<nodes::AvaFrameSandboxNode>();
+    if (solver == nullptr || sandbox == nullptr || sandbox->terrain() == nullptr)
+        return;
+    QJsonObject run_info;
+    QJsonObject solver_settings;
+    solver->serialize_settings(solver_settings);
+    run_info["solver_settings"] = solver_settings;
+    run_info["material_preset"] = QString::fromStdString(m_material_presets[size_t(m_selected_material_preset)].name);
+    run_info["stopped_by"] = QString::fromStdString(stopped_by);
+    run_info["particles"] = int(solver->last_state().active_particles);
+    run_info["gpu_ms_per_substep"] = double(solver->perf_stats().gpu_ms_per_substep);
+    run_info["energy_line_mu_eff"] = double(solver->energy_line_friction());
+    // Computing time: wall clock since the reset (pauses included, so meaningful for batch runs)
+    // and the solver's own GPU time, measured per substep with timestamp queries.
+    const auto& s = solver->get_settings();
+    run_info["wall_time_s"] = double(solver->wall_time_since_reset());
+    // Did the run touch the box? Shares of particle-substeps since the reset (see SimStateReadback).
+    const auto& contacts = solver->contacts_since_reset();
+    const double particle_substeps = std::max(double(contacts.particle_substeps), 1.0);
+    run_info["wall_contact_share"] = double(contacts.wall) / particle_substeps;
+    run_info["ceiling_contact_share"] = double(contacts.ceiling) / particle_substeps;
+    run_info["domain_size_m"] = double(solver->domain_size_metres());
+    run_info["gpu_time_s"] = double(solver->perf_stats().gpu_ms_per_substep) / 1000.0 * double(solver->simulated_time() / std::max(s.dt, 1e-6f));
+    if (m_batch_phase != BatchPhase::Idle && m_batch_index < m_batch.size())
+        run_info["label"] = QString::fromStdString(m_batch[m_batch_index].label);
+    const float density = solver->get_settings().snow_density;
+    const std::string key = sandbox->terrain()->dataset_path + "/" + sandbox->terrain()->scenario;
+    m_sandbox_status = "Exporting...";
+    solver->read_back_peaks([this, key, density, run_info](const nodes::MpmSolverNode::ColumnPeaks& peaks) {
+        // The dataset may have changed while the readback was pending.
+        auto* current = find_node<nodes::AvaFrameSandboxNode>();
+        const nodes::SandboxTerrain* terrain = current ? current->terrain() : nullptr;
+        if (terrain == nullptr || terrain->dataset_path + "/" + terrain->scenario != key)
+            return;
+        const auto rasters = nodes::resample_sandbox_peaks(*terrain, peaks, density);
+        const auto summary = nodes::write_sandbox_result(*terrain, rasters, peaks, density, run_info);
+        if (summary.directory.empty()) {
+            m_sandbox_status = "Export failed: " + summary.error;
+            m_last_export = "error: " + summary.error;
+            qWarning() << "AvaFrame sandbox:" << QString::fromStdString(m_sandbox_status);
+            return;
+        }
+        m_sandbox_status = "Exported to " + summary.directory;
+        m_last_export = summary.directory;
+        qInfo().nospace() << "AvaFrame sandbox: exported " << QString::fromStdString(summary.directory) << " - t " << peaks.simulated_time
+                          << " s, max pft " << summary.max_thickness << " m, max pfv " << summary.max_speed << " m/s, footprint "
+                          << summary.footprint_area / 1e4 << " ha (" << summary.footprint_area_10cm / 1e4 << " ha with pft > 0.1 m)";
+    });
+}
+
+void AvalanchePanel::draw_sandbox_section(nodes::AvaFrameSandboxNode& sandbox)
+{
+    ImGui::TextDisabled("AvaFrame sandbox: the solver runs on AvaFrame's DEM, not on the map.");
+    if (m_sandbox_datasets.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s", m_sandbox_scan_error.c_str());
+    } else {
+        std::vector<std::string> labels;
+        for (const auto& dataset : m_sandbox_datasets)
+            labels.push_back(dataset.name + (dataset.geolocated ? "" : " (synthetic)") + (dataset.has_reference ? "" : " - no reference"));
+        std::vector<const char*> names;
+        for (const auto& label : labels)
+            names.push_back(label.c_str());
+        bool changed = ImGui::Combo("Dataset", &m_sandbox_dataset, names.data(), int(names.size()));
+        if (changed)
+            m_sandbox_scenario = 0;
+        const auto& scenarios = m_sandbox_datasets[size_t(m_sandbox_dataset)].scenarios;
+        std::vector<const char*> scenario_names;
+        for (const auto& scenario : scenarios)
+            scenario_names.push_back(scenario.c_str());
+        changed |= ImGui::Combo("Release", &m_sandbox_scenario, scenario_names.data(), int(scenario_names.size()));
+        if (changed) {
+            save_startup_settings();
+            m_scenario_error = apply_sandbox_dataset() ? std::string {} : std::string { "Could not load the sandbox dataset." };
+        }
+    }
+
+    if (const nodes::SandboxTerrain* t = sandbox.terrain()) {
+        ImGui::TextDisabled("DEM %ux%u @ %.1f m, release %.0f m3 on %.2f ha, reference %s", t->grid_size.x, t->grid_size.y, t->cellsize,
+            t->release_volume, t->release_area / 1e4, t->reference_name.empty() ? "none" : t->reference_name.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Release volume from AvaFrame's slope-normal thickness: sum of thickness x surface area.\n"
+                              "Reference: the com1DFA benchmark run of this release scenario (AvaFrame v1.11).");
+    }
+    if (auto* solver = find_solver()) {
+        auto settings = solver->get_settings();
+        bool stop_at_rest = settings.stop_kinetic_fraction > 0.0f;
+        if (ImGui::Checkbox("Stop at rest", &stop_at_rest)) {
+            settings.stop_kinetic_fraction = stop_at_rest ? 0.01f : 0.0f;
+            solver->set_settings(settings);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pause once the kinetic energy has fallen below 1 %% of its peak - com1DFA's stop criterion\n"
+                              "(the AvaFrame benchmarks: \"< 1.00 percent of PKE\").");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("then export", &m_sandbox_auto_export))
+            save_startup_settings();
+        ImGui::SameLine();
+        if (ImGui::Button("Export now"))
+            export_sandbox_result("manual");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Peak flow thickness, velocity and pressure since the reset, as pft/pfv/ppr .asc on the DEM grid\n"
+                              "in <dataset>/mpm/<time>_<release>/, with params.json - the same layout as AvaFrame's results.");
+        if (!m_sandbox_status.empty())
+            ImGui::TextWrapped("%s", m_sandbox_status.c_str());
+    }
+    if (ImGui::Button(m_sandbox_view.open ? "Hide sandbox view" : "Show sandbox view")) {
+        m_sandbox_view.open = !m_sandbox_view.open;
+        save_startup_settings();
+    }
+    if (const nodes::SandboxTerrain* t = sandbox.terrain(); t != nullptr && t->centre_lat_lon) {
+        ImGui::SameLine();
+        if (ImGui::Button("Show on the map"))
+            emit fly_to_requested(t->centre_lat_lon->x, t->centre_lat_lon->y);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Flies the camera to the dataset. The overlay there shows the release (cyan), the MPM peak flow\n"
+                              "thickness above 0.1 m (colour scale of the sandbox view) and the com1DFA footprint (green),\n"
+                              "on weBIGeo's own terrain - placed by an affine fit to AvaFrame's DEM corners.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Back to the map")) {
+        m_startup_sandbox = false;
+        save_startup_settings();
+        m_graph_panel->load_preset(MPM_GRAPH_PRESET);
+        m_scenario_error = apply_scenario(m_scenarios[size_t(m_selected_scenario)]) ? std::string {} : std::string { "Could not apply the scenario." };
+    }
+}
+
+bool AvalanchePanel::load_batch(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        qWarning() << "AvaFrame batch: cannot open" << path;
+        return false;
+    }
+    const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    for (const auto& value : root["runs"].toArray()) {
+        const QJsonObject r = value.toObject();
+        BatchRun run;
+        run.dataset = r["dataset"].toString().toStdString();
+        run.scenario = r["scenario"].toString().toStdString();
+        run.material_preset = r["material_preset"].toString().toStdString();
+        run.settings = r["settings"].toObject();
+        run.max_time = float(r["max_time"].toDouble(400.0));
+        run.trajectories = r["model"].toString() == "trajectories";
+        run.label = r["label"].toString(QString::fromStdString(run.dataset + "_" + std::to_string(m_batch.size()))).toStdString();
+        m_batch.push_back(std::move(run));
+    }
+    m_batch_quit = root["quit"].toBool(true);
+    m_batch_file = path;
+    if (m_batch.empty()) {
+        qWarning() << "AvaFrame batch: no runs in" << path;
+        return false;
+    }
+    m_batch_phase = BatchPhase::Loading; // from here on, save_startup_settings() is a no-op
+    m_pacing = Pacing::Fast;
+    m_sandbox_auto_export = false; // the batch exports itself
+    qInfo() << "AvaFrame batch:" << m_batch.size() << "runs from" << path;
+    return true;
+}
+
+void AvalanchePanel::start_batch_run()
+{
+    while (m_batch_index < m_batch.size()) {
+        const BatchRun& run = m_batch[m_batch_index];
+        const auto dataset = std::find_if(m_sandbox_datasets.begin(), m_sandbox_datasets.end(), [&](const auto& d) { return d.name == run.dataset; });
+        const auto preset = std::find_if(m_material_presets.begin(), m_material_presets.end(), [&](const auto& p) { return p.name == run.material_preset; });
+        std::string error;
+        if (dataset == m_sandbox_datasets.end())
+            error = "unknown dataset " + run.dataset;
+        else if (!run.material_preset.empty() && preset == m_material_presets.end())
+            error = "unknown material preset " + run.material_preset;
+        int scenario = 0;
+        if (error.empty() && !run.scenario.empty()) {
+            scenario = int(std::find(dataset->scenarios.begin(), dataset->scenarios.end(), run.scenario) - dataset->scenarios.begin());
+            if (scenario >= int(dataset->scenarios.size()))
+                error = "unknown release scenario " + run.scenario;
+        }
+        if (!error.empty()) {
+            qWarning() << "AvaFrame batch: run" << QString::fromStdString(run.label) << "skipped:" << QString::fromStdString(error);
+            m_batch_results.append(QJsonObject { { "label", QString::fromStdString(run.label) }, { "error", QString::fromStdString(error) } });
+            m_batch_index++;
+            continue;
+        }
+        qInfo().nospace() << "AvaFrame batch: run " << (m_batch_index + 1) << "/" << m_batch.size() << " " << QString::fromStdString(run.label);
+        m_sandbox_dataset = int(dataset - m_sandbox_datasets.begin());
+        m_sandbox_scenario = scenario;
+        if (run.trajectories) {
+            // A fresh graph per run: its layer buffers exist only once the model has run.
+            m_graph_panel->load_preset(TRAJECTORIES_SANDBOX_GRAPH_PRESET);
+            if (auto* model = find_node<nodes::ComputeAvalancheTrajectoriesNode>()) {
+                QJsonObject settings;
+                model->serialize_settings(settings);
+                for (auto it = run.settings.begin(); it != run.settings.end(); ++it)
+                    settings[it.key()] = it.value();
+                model->deserialize_settings(settings);
+            }
+        } else if (find_node<nodes::AvaFrameSandboxNode>() == nullptr || find_solver() == nullptr) {
+            m_graph_panel->load_preset(SANDBOX_GRAPH_PRESET);
+        }
+        if (preset != m_material_presets.end()) {
+            m_selected_material_preset = int(preset - m_material_presets.begin());
+            apply_material_preset(*preset);
+        }
+        m_sandbox_configured.clear(); // configure again even on the same dataset
+        m_last_export.clear();
+        m_batch_run_started = std::chrono::steady_clock::now();
+        apply_sandbox_dataset();
+        m_batch_phase = BatchPhase::Loading;
+        return;
+    }
+    finish_batch();
+}
+
+void AvalanchePanel::batch_tick()
+{
+    const BatchRun& run = m_batch[m_batch_index];
+    if (run.trajectories) {
+        // The trajectory model runs once with the graph; export when its layers exist.
+        auto* sandbox = find_node<nodes::AvaFrameSandboxNode>();
+        auto* model = find_node<nodes::ComputeAvalancheTrajectoriesNode>();
+        if (m_batch_phase == BatchPhase::Loading) {
+            if (sandbox == nullptr || model == nullptr || sandbox->terrain() == nullptr || model->is_running())
+                return;
+            auto* zdelta = std::get<nodes::data_type<webgpu::raii::RawBuffer<uint32_t>*>()>(model->output_socket("layer1_zdelta").get_data());
+            auto* counts = std::get<nodes::data_type<webgpu::raii::RawBuffer<uint32_t>*>()>(model->output_socket("layer2_cellCounts").get_data());
+            if (zdelta == nullptr || counts == nullptr)
+                return;
+            QJsonObject settings;
+            model->serialize_settings(settings);
+            QJsonObject run_info { { "label", QString::fromStdString(run.label) }, { "trajectory_settings", settings },
+                { "wall_time_s", std::chrono::duration<double>(std::chrono::steady_clock::now() - m_batch_run_started).count() } };
+            m_last_export.clear();
+            m_batch_phase = BatchPhase::Exporting;
+            sandbox->export_trajectories(*zdelta, *counts, run_info, [this](const nodes::SandboxRunSummary& summary) {
+                m_last_export = summary.directory.empty() ? "error: " + summary.error : summary.directory;
+                qInfo().nospace() << "AvaFrame batch: trajectories exported " << QString::fromStdString(m_last_export) << ", footprint "
+                                  << summary.footprint_area / 1e4 << " ha";
+            });
+            return;
+        }
+        if (m_batch_phase == BatchPhase::Exporting && !m_last_export.empty()) {
+            m_batch_results.append(QJsonObject { { "label", QString::fromStdString(run.label) }, { "dataset", QString::fromStdString(run.dataset) },
+                { "result", QString::fromStdString(m_last_export) } });
+            m_batch_index++;
+            start_batch_run();
+        }
+        return;
+    }
+    auto* solver_node = find_solver();
+    if (solver_node == nullptr)
+        return;
+    auto& solver = *solver_node;
+    switch (m_batch_phase) {
+    case BatchPhase::Loading: {
+        // Wait until the dataset is in and the solver sized for it, then apply the run's settings.
+        auto* sandbox = find_node<nodes::AvaFrameSandboxNode>();
+        const nodes::SandboxTerrain* t = sandbox ? sandbox->terrain() : nullptr;
+        if (t == nullptr || m_sandbox_configured != t->dataset_path + "/" + t->scenario || !solver.has_valid_inputs() || solver.is_running())
+            return;
+        QJsonObject settings;
+        solver.serialize_settings(settings);
+        for (auto it = run.settings.begin(); it != run.settings.end(); ++it)
+            settings[it.key()] = it.value();
+        solver.deserialize_settings(settings); // also requests the reset
+        m_sandbox_stopped = false;
+        m_playing = true;
+        m_batch_phase = BatchPhase::Running;
+        return;
+    }
+    case BatchPhase::Running: {
+        const bool rest = solver.at_rest();
+        if (!rest && solver.simulated_time() < run.max_time)
+            return;
+        m_playing = false;
+        m_sandbox_stopped = true;
+        qInfo().nospace() << "AvaFrame batch: " << QString::fromStdString(run.label) << (rest ? " at rest after " : " reached the time limit at ")
+                          << solver.simulated_time() << " s";
+        m_last_export.clear();
+        export_sandbox_result(rest ? "at rest" : "max time");
+        m_batch_phase = BatchPhase::Exporting;
+        return;
+    }
+    case BatchPhase::Exporting:
+        if (m_last_export.empty())
+            return;
+        m_batch_results.append(QJsonObject { { "label", QString::fromStdString(run.label) }, { "dataset", QString::fromStdString(run.dataset) },
+            { "result", QString::fromStdString(m_last_export) } });
+        m_batch_index++;
+        start_batch_run();
+        return;
+    default:
+        return;
+    }
+}
+
+void AvalanchePanel::finish_batch()
+{
+    m_batch_phase = BatchPhase::Done;
+    QFile out(m_batch_file + ".results.json");
+    if (out.open(QIODevice::WriteOnly))
+        out.write(QJsonDocument(QJsonObject { { "runs", m_batch_results } }).toJson());
+    qInfo() << "AvaFrame batch: done," << m_batch_results.size() << "runs, results in" << out.fileName();
+    if (m_batch_quit) {
+        SDL_Event quit {};
+        quit.type = SDL_QUIT;
+        SDL_PushEvent(&quit);
+    }
+}
+
 void AvalanchePanel::draw()
 {
+    if (m_batch_phase != BatchPhase::Idle && m_batch_phase != BatchPhase::Done && m_batch_index < m_batch.size()) {
+        if (auto* sandbox = find_node<nodes::AvaFrameSandboxNode>(); sandbox != nullptr && find_solver() != nullptr)
+            configure_sandbox_solver(*sandbox, *find_solver());
+        batch_tick();
+    }
+    if (auto* sandbox = find_node<nodes::AvaFrameSandboxNode>()) {
+        if (auto* solver = find_solver()) {
+            configure_sandbox_solver(*sandbox, *solver);
+            // com1DFA's stop criterion: pause once at rest and export if asked to. Play continues
+            // past it; a reset (simulated time going back) re-arms it.
+            if (solver->simulated_time() < m_sandbox_last_time)
+                m_sandbox_stopped = false;
+            m_sandbox_last_time = solver->simulated_time();
+            if (m_playing && solver->at_rest() && !m_sandbox_stopped && m_batch_phase == BatchPhase::Idle) {
+                m_sandbox_stopped = true;
+                m_playing = false;
+                m_sandbox_status = "At rest after " + std::to_string(int(solver->simulated_time())) + " s (kinetic energy < 1 % of its peak).";
+                qInfo().nospace() << "AvaFrame sandbox: at rest after " << solver->simulated_time() << " s";
+                if (m_sandbox_auto_export)
+                    export_sandbox_result("at rest");
+            }
+            m_sandbox_view.draw(*sandbox, *solver);
+            if (m_sandbox_view.layer_changed) {
+                m_sandbox_view.layer_changed = false;
+                save_startup_settings();
+            }
+        }
+    }
+
     // Stepping lives here rather than in draw_panel() so the animation keeps running with
     // the sidebar section collapsed and the node graph editor closed.
     if (m_autoplay_pending) {
@@ -354,35 +850,52 @@ void AvalanchePanel::draw_panel()
             m_graph_panel->load_preset(MPM_GRAPH_PRESET);
             m_scenario_error = apply_scenario(m_scenarios[size_t(m_selected_scenario)]) ? std::string {} : std::string { "Could not apply the scenario." };
         }
+        if (ImGui::Button("Load the AvaFrame sandbox"))
+            load_sandbox();
         draw_startup_settings();
         return;
     }
 
+    auto* sandbox = find_node<nodes::AvaFrameSandboxNode>();
+    if (sandbox != nullptr) {
+        draw_sandbox_section(*sandbox);
+        if (!m_scenario_error.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", m_scenario_error.c_str());
+        ImGui::Separator();
+    }
+
     // --- Location ---
     // Needs a GeoRegionNode in the graph; a GPX-driven graph has no coordinates to set.
-    const bool can_switch_location = find_node<nodes::GeoRegionNode>() != nullptr;
-    ImGui::BeginDisabled(!can_switch_location);
-    std::vector<const char*> names;
-    names.reserve(m_scenarios.size());
-    for (const auto& scenario : m_scenarios)
-        names.push_back(scenario.name.c_str());
-    if (ImGui::Combo("Location", &m_selected_scenario, names.data(), int(names.size()))) {
-        m_scenario_error = apply_scenario(m_scenarios[size_t(m_selected_scenario)])
-            ? std::string {}
-            : std::string { "Could not apply - the active graph has no GeoRegionNode." };
-        save_startup_settings();
-    }
-    ImGui::EndDisabled();
+    if (sandbox == nullptr) {
+        const bool can_switch_location = find_node<nodes::GeoRegionNode>() != nullptr;
+        ImGui::BeginDisabled(!can_switch_location);
+        std::vector<const char*> names;
+        names.reserve(m_scenarios.size());
+        for (const auto& scenario : m_scenarios)
+            names.push_back(scenario.name.c_str());
+        if (ImGui::Combo("Location", &m_selected_scenario, names.data(), int(names.size()))) {
+            m_scenario_error = apply_scenario(m_scenarios[size_t(m_selected_scenario)])
+                ? std::string {}
+                : std::string { "Could not apply - the active graph has no GeoRegionNode." };
+            save_startup_settings();
+        }
+        ImGui::EndDisabled();
 
-    if (!can_switch_location) {
-        ImGui::TextDisabled("Load the MLS-MPM preset to switch location.");
-    } else {
-        ImGui::TextDisabled("%s", m_scenarios[size_t(m_selected_scenario)].note.c_str());
-    }
-    if (!m_scenario_error.empty())
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", m_scenario_error.c_str());
+        if (!can_switch_location) {
+            ImGui::TextDisabled("Load the MLS-MPM preset to switch location.");
+        } else {
+            ImGui::TextDisabled("%s", m_scenarios[size_t(m_selected_scenario)].note.c_str());
+        }
+        if (!m_scenario_error.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", m_scenario_error.c_str());
+        if (ImGui::Button("AvaFrame sandbox"))
+            load_sandbox();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Run the solver on an AvaFrame test case (DEM and release area) instead of the map,\n"
+                              "for comparison with com1DFA. Datasets: mpm-mls-doc/avaframe/prepare_dataset.py.");
 
-    ImGui::Separator();
+        ImGui::Separator();
+    }
 
     const bool ready = solver->has_valid_inputs();
     if (!ready) {
@@ -399,7 +912,7 @@ void AvalanchePanel::draw_panel()
     ImGui::Text("Simulated time: %.2f s", double(solver->simulated_time()));
 
     const auto& aabb = solver->domain_aabb();
-    if (aabb.size().x > 0.0) {
+    if (aabb.size().x > 0.0 && sandbox == nullptr) {
         const glm::dvec2 centre = nucleus::srs::world_to_lat_long((aabb.min + aabb.max) * 0.5);
         ImGui::TextDisabled("Centre: %.5f, %.5f", centre.x, centre.y);
     }
@@ -560,8 +1073,10 @@ void AvalanchePanel::draw_panel()
 
     // Domain changes reallocate GPU buffers, so they reseed - apply them on release only.
     ImGui::TextDisabled("Simulation domain (changes reset the run)");
-    settings_changed |= ImGui::DragScalarN("Domain lat/lon", ImGuiDataType_Double, &settings.domain_center.x, 2, 0.0001f, nullptr, nullptr, "%.5f");
-    step_now |= ImGui::IsItemDeactivatedAfterEdit();
+    if (sandbox == nullptr) {
+        settings_changed |= ImGui::DragScalarN("Domain lat/lon", ImGuiDataType_Double, &settings.domain_center.x, 2, 0.0001f, nullptr, nullptr, "%.5f");
+        step_now |= ImGui::IsItemDeactivatedAfterEdit();
+    }
     settings_changed |= ImGui::DragFloat("Domain size", &settings.domain_size_xy, 16.0f, 64.0f, 16384.0f, "%.0f m");
     step_now |= ImGui::IsItemDeactivatedAfterEdit();
 
@@ -589,17 +1104,20 @@ void AvalanchePanel::draw_panel()
 
     ImGui::Separator();
 
-    // Release zone is independent of the domain: small start area, large runout box.
-    ImGui::TextDisabled("Release zone (changes reset the run)");
-    settings_changed |= ImGui::DragScalarN("Release lat/lon", ImGuiDataType_Double, &settings.release_center.x, 2, 0.0001f, nullptr, nullptr, "%.5f");
-    step_now |= ImGui::IsItemDeactivatedAfterEdit();
-    settings_changed |= ImGui::DragFloat("Release radius", &settings.release_radius, 2.0f, 1.0f, 2000.0f, "%.0f m");
-    step_now |= ImGui::IsItemDeactivatedAfterEdit();
+    // Release zone is independent of the domain: small start area, large runout box. The
+    // sandbox takes it from the dataset.
+    if (sandbox == nullptr) {
+        ImGui::TextDisabled("Release zone (changes reset the run)");
+        settings_changed |= ImGui::DragScalarN("Release lat/lon", ImGuiDataType_Double, &settings.release_center.x, 2, 0.0001f, nullptr, nullptr, "%.5f");
+        step_now |= ImGui::IsItemDeactivatedAfterEdit();
+        settings_changed |= ImGui::DragFloat("Release radius", &settings.release_radius, 2.0f, 1.0f, 2000.0f, "%.0f m");
+        step_now |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if (ImGui::Checkbox("Seed anywhere (ignore release areas)", &settings.seed_anywhere)) {
-        settings_changed = true;
-        settings.reset_on_next_run = true;
-        step_now = true;
+        if (ImGui::Checkbox("Seed anywhere (ignore release areas)", &settings.seed_anywhere)) {
+            settings_changed = true;
+            settings.reset_on_next_run = true;
+            step_now = true;
+        }
     }
 
     ImGui::TextDisabled("Full parameters: compute graph editor.");

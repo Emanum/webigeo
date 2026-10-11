@@ -42,6 +42,7 @@ set(SOURCES
     nodes/MpmSolverNode.h nodes/MpmSolverNode.cpp
     nodes/GeoRegionNode.h nodes/GeoRegionNode.cpp
     nodes/LoadTextureNode.h nodes/LoadTextureNode.cpp
+    nodes/AvaFrameSandboxNode.h nodes/AvaFrameSandboxNode.cpp
     nodes/util.h nodes/util.cpp
 )
 
@@ -95,6 +96,7 @@ qt_add_resources(webgpu_compute "webgpu_compute_shaders"
         "${SHADER_BASE_DIR}/mpm_p2g.wgsl"
         "${SHADER_BASE_DIR}/mpm_grid_update.wgsl"
         "${SHADER_BASE_DIR}/mpm_g2p.wgsl"
+        "${SHADER_BASE_DIR}/mpm_column_stats.wgsl"
         "${SHADER_BASE_DIR}/mpm_refresh_stress.wgsl"
         "${SHADER_BASE_DIR}/mpm_splat.wgsl"
         "${SHADER_BASE_DIR}/mpm_rasterize.wgsl"
