@@ -1,4 +1,4 @@
-# The eight kernels
+# The nine kernels
 
 All in `webgpu/compute/shaders/`. Every one starts with `///use mpm_common` (weBIGeo's
 shader preprocessor include directive), so they all declare the **identical binding set** —
@@ -38,7 +38,7 @@ follows the snow instead of the domain. See [09-performance-analysis.md](09-perf
 2  texture    release_point_texture    RGBA8Unorm, alpha > 0 marks a release cell (map);
                                        R32Float release depth (sandbox) - layout unfilterable-float
 3  storage    particles      array<Particle>       read_write
-4  storage    grid           array<GridNode>       read_write, atomic<i32>
+4  storage    grid           array<GridNode>       read_write, mass atomic<u32> lo/hi, momentum atomic<i32>
 5  storage    state          SimState              read_write, atomics
 6  storage    density_raster array<atomic<u32>>    read_write
 7  storage    output_texture rgba8unorm            write
@@ -55,7 +55,9 @@ is not.
 
 ## Modules (not kernels)
 
-Three files carry no entry point; kernels `///use` them.
+Six files carry no entry point; kernels `///use` them: the three below, and the three model
+files behind `mpm_material` (`mpm_material_stomakhin`, `mpm_material_drucker_prager`,
+`mpm_material_ccc`).
 
 | Module | Provides | Used by |
 |---|---|---|
@@ -288,3 +290,21 @@ hard-coding a constant means the display rescales itself when particle count or 
 change.
 
 Empty texels are written fully transparent.
+
+## Rendering shaders (engine, not solver kernels)
+
+The 3D view on the map lives in `webgpu/engine/shaders/` and only *reads* the particle buffer;
+nothing here feeds back into the simulation. Run by `AvalancheRenderer` each frame. Design
+and verification: [12-rendering-plan.md](12-rendering-plan.md).
+
+| Shader | Stage | What it does |
+|---|---|---|
+| `avalanche_surface_splat` | compute, 256×1×1 over particles | Quadratic B-spline (the solver's, at its dx) splat of each particle's volume (spacing³) onto a render grid 1–4× finer than the solver's; per node Σw, Σw·speed, Σw·height above terrain as fixed-point atomics. Particles more than 2 dx up are faded out. |
+| `avalanche_surface_field` | compute, 16×16×1 over render nodes | Depth = Σw·V/dx², blanket height = 2·mean height + radius (tapered at the edge), mean speed, persistent peak depth (track, cleared on reset). |
+| `render_avalanche_surface` | render, G-buffer | One quad per render cell, rejected unless a corner reaches min_depth; discard below the contour; track albedo at the rim and where only the peak depth remains. |
+| `render_avalanche` | render, G-buffer | Sphere / strain-rate-ellipsoid impostors (vertex pulling, ray–ellipsoid, `frag_depth`), optional detail particles. |
+| `render_avalanche_powder` | render, after compose | Soft transparent blobs with per-particle noise, premultiplied "over", faded by the share of the ray path in front of the G-buffer depth. |
+
+All avalanche fragments write `AVALANCHE_MARKER` (`0x00FFFFFF`) into the G-buffer overlay slot,
+so `overlays/screen_space_snow.wgsl` leaves them alone. `scripts/validate_wgsl.py` checks these
+shaders together with the kernels.

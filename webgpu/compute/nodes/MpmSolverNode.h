@@ -57,6 +57,31 @@ struct SandboxTerrain;
 /// the release point texture. With the optional "sandbox" input connected (AvaFrameSandboxNode),
 /// the region is a DEM in metres, the domain is centred on the dataset's avalanche and the
 /// release texture holds the release depth per cell.
+/// What a renderer needs to draw the particles where they are, read straight from the GPU
+/// buffer (layout: struct Particle in mpm_common.wgsl, PARTICLE_STRIDE_U32 words each). Owned
+/// by the solver and kept current across reallocations, so a renderer can hold the pointer for
+/// the solver's lifetime and read it every frame.
+struct MpmParticleView {
+    const webgpu::raii::RawBuffer<uint32_t>* particles = nullptr; // nullptr before the first run
+    uint32_t particle_count = 0; // allocated; inactive ones have mass 0
+    /* Solver metres (particle.position.xy) -> weBIGeo world xy (Web Mercator), as
+     * world = M * (x, y, 1). Map: region offset and 1/cos(latitude). Sandbox: the affine fit of
+     * SandboxTerrain::sandbox_to_world. Heights are real metres; world z = altitude / cos(latitude). */
+    glm::dmat3 world_from_metres = glm::dmat3(1.0);
+    bool placed = false; // false for a synthetic sandbox dataset, which has no place on the map
+    float particle_spacing = 1.0f; // [m] cube root of the release volume per particle
+    /* The solver's grid columns (nodes at domain_origin + index * dx, in metres), for renderers
+     * that aggregate the particles per column, like the flow surface. */
+    glm::vec2 domain_origin = glm::vec2(0.0f);
+    float dx = 1.0f;
+    glm::uvec2 columns = glm::uvec2(0u);
+    /* The terrain the solver runs on (R32Float, altitudes in metres, uv = metres / region_size
+     * with v pointing south), so a renderer can drape things over the same ground. */
+    const webgpu::raii::TextureWithSampler* height_texture = nullptr;
+    glm::vec2 region_size = glm::vec2(1.0f); // [m]
+    uint32_t reset_count = 0; // changes when the particles are released anew (Reset), so per-run memory can be cleared
+};
+
 class MpmSolverNode : public Node {
     Q_OBJECT
 
@@ -277,6 +302,9 @@ public:
     /// Metres per world unit at the region, cos(latitude). 1 until the first run, and 1 in
     /// the sandbox, whose region is already in metres.
     double metres_per_world_unit() const { return m_metres_per_world_unit; }
+    /// The particles for a renderer, see MpmParticleView. The pointer stays valid for the
+    /// solver's lifetime.
+    const MpmParticleView* particle_view() const { return &m_particle_view; }
 
     /// The sandbox the solver runs on, or nullptr when it runs on the map (the optional
     /// "sandbox" input is not connected or its node has not run).
@@ -455,6 +483,7 @@ private:
 
     radix::geometry::Aabb<2, double> m_domain_aabb;
     double m_metres_per_world_unit = 1.0;
+    MpmParticleView m_particle_view;
     glm::uvec2 m_output_dimensions = glm::uvec2(0);
     float m_simulated_time = 0.0f;
 

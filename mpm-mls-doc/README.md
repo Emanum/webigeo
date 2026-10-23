@@ -17,7 +17,7 @@ from the sources when writing the report. Full list in [refs.md](refs.md).
 |---|---|
 | [01-theory.md](01-theory.md) | FLIP → MPM → MLS-MPM → snow model. The maths that is actually implemented, with pointers into the papers. |
 | [02-files-and-api.md](02-files-and-api.md) | Every file added or touched, the C++ classes, what each method does. |
-| [03-shaders.md](03-shaders.md) | The eight WGSL kernels, one at a time, with the formula each implements. |
+| [03-shaders.md](03-shaders.md) | The nine WGSL kernels, one at a time, with the formula each implements. |
 | [04-data-layout.md](04-data-layout.md) | Buffer/struct layouts, fixed-point atomics, coordinate conventions, uniform layout rules. |
 | [05-tuning.md](05-tuning.md) | Which knob does what, sensible ranges, failure modes, how to extend. |
 | [06-verification.md](06-verification.md) | What was actually tested, how, and what is still unverified. |
@@ -31,6 +31,7 @@ from the sources when writing the report. Full list in [refs.md](refs.md).
 | [10-benchmark-results.md](10-benchmark-results.md) | Every checked-in benchmark result as a table: Apple M5 (Chrome/Metal) and SwiftShader, per material, per stage. Generated from `bench/results/*.json`. |
 | [report-fixed-point-energy-pump.md](report-fixed-point-energy-pump.md) | Standalone write-up of the fixed-point blow-up investigation. |
 | [11-avaframe-comparison.md](11-avaframe-comparison.md) | **AvaFrame comparison**: MPM variants, com4FlowPy and the weBIGeo trajectory model against com1DFA on five real avalanches, rated with AIMEC. Setup, tables, findings, limits. |
+| [12-rendering-plan.md](12-rendering-plan.md) | **3D rendering on the map**: particles (ellipsoids, detail particles, powder), the mass-splat flow surface, track and snow cover. Research, decisions, what was tried and rejected, verification per step. |
 | [avaframe/](avaframe/README.md) | **AvaFrame comparison, phase 1**: prepares AvaFrame's test cases (DEM, release, com1DFA reference rasters, AIMEC path, map overlays) for comparing against the MPM solver. |
 | [refs.md](refs.md) | Bibliography. |
 
@@ -47,7 +48,8 @@ Region ─→ Select Tiles ─→ Request Height ─→ Stitch Tiles ─→ Heig
                                                                            │                              │
                                                                            └──────────────┬───────────────┘
                                                                                           ↓
-                                                                                     MPM Solver ─→ Overlay
+                                                                                     MPM Solver ─┬─→ Overlay       (2D density raster)
+                                                                                                 └─→ Particles 3D  (AvalancheRenderer, map graph)
 ```
 
 One node execution = `substeps_per_run` MPM steps. Re-running continues from the current
@@ -68,11 +70,14 @@ a picker for stored locations.
 
 Known gaps, honestly:
 
-- **Output is a 2D top-down density raster**, not 3D particles. The proposal's Phase 5
-  (a real `AvalancheRenderer` in `webgpu/engine/`) is not implemented. The node already
-  exposes a raw `particle buffer` socket so a renderer can bind it without CPU readback.
-- **Parameters are Stomakhin's paper values**, authored for metre-scale snow. At 12–16 m
-  grid cells the released slab is sub-cell and the flow reads more fluid than slab-like.
+- **3D rendering on the map** (2026-10-23, [12-rendering-plan.md](12-rendering-plan.md)):
+  an `AvalancheRenderer` in `webgpu/engine/` draws a draped flow surface from a B-spline
+  mass splat, a track where the flow has been, a lit snow cover that thins to patches below
+  the snow line, and the particles as soft powder (default), ellipsoids or spheres. The 2D
+  density raster remains the output in the sandbox and when the 3D view is off. Not
+  measured yet: the GPU cost of the renderer; not tested: the web build.
+- **Parameters are Stomakhin's paper values**, authored for metre-scale snow. At the default
+  12.5 m grid cells the released slab is sub-cell and the flow reads more fluid than slab-like.
   See [05-tuning.md](05-tuning.md).
 - Material layer is **done** as far as proposal v3.0 goes (2026-09-13): Stomakhin,
   Drucker–Prager and Cohesive Cam Clay switchable at runtime, Coulomb and Voellmy basal

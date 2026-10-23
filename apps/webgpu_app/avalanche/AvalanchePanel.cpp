@@ -20,6 +20,8 @@
 
 #include "AvaFrameData.h"
 #include "compute/NodeGraphPanel.h"
+#include "compute/OverlayRenderNode.h"
+#include "compute/ParticleRenderNode.h"
 #include "ui/UiScale.h"
 #include <IconsFontAwesome5.h>
 #ifdef __EMSCRIPTEN__
@@ -456,6 +458,21 @@ void AvalanchePanel::configure_sandbox_solver(const nodes::AvaFrameSandboxNode& 
     // A real dataset also shows on the map (AvaFrameSandboxNode::update_map_overlay): go there.
     if (terrain->sandbox_to_world)
         frame_on_map(*terrain);
+}
+
+void AvalanchePanel::look_at_flow(const nodes::MpmSolverNode& solver, double distance_metres)
+{
+    const auto* view = solver.particle_view();
+    const auto& state = solver.last_state();
+    if (!view->placed || !state.valid)
+        return;
+    // Centre of mass from solver metres to world: xy through the particle view, z like the
+    // terrain (world units are 1/cos(latitude) metres, heights included).
+    const glm::dvec3 com = state.centre_of_mass;
+    const glm::dvec2 world_xy = glm::dvec2(view->world_from_metres * glm::dvec3(com.x, com.y, 1.0));
+    const double world_per_metre = 1.0 / std::cos(glm::radians(nucleus::srs::world_to_lat_long(world_xy).x));
+    const glm::dvec3 look_at(world_xy, com.z * world_per_metre);
+    emit camera_requested(look_at + glm::normalize(glm::dvec3(0.0, -0.6, 1.0)) * distance_metres * world_per_metre, look_at);
 }
 
 void AvalanchePanel::frame_on_map(const nodes::SandboxTerrain& terrain)
@@ -937,6 +954,18 @@ void AvalanchePanel::finish_batch()
 
 void AvalanchePanel::draw()
 {
+    // In the map graph, the 3D particles replace the 2D density overlay: show one or the other.
+    if (auto* particles = find_node<nodes::ParticleRenderNode>()) {
+        if (auto* overlay = find_node<nodes::OverlayRenderNode>())
+            overlay->set_overlay_enabled(!particles->renderer_settings().enabled);
+        float min_altitude = 0.0f, max_altitude = 0.0f; // unknown until the solver reports its terrain scan
+        if (auto* solver = find_solver(); solver != nullptr && solver->last_state().valid) {
+            min_altitude = solver->last_state().min_altitude;
+            max_altitude = solver->last_state().max_altitude;
+        }
+        particles->sync_snow_cover(min_altitude, max_altitude);
+    }
+
     if (auto* solver = find_solver(); solver != nullptr && find_node<nodes::AvaFrameSandboxNode>() == nullptr)
         frame_scenario_when_ready(*solver);
 
@@ -1201,6 +1230,95 @@ void AvalanchePanel::draw_panel()
     draw_performance(*solver);
 
     ImGui::Separator();
+
+    // --- 3D view of the particles (ParticleRenderNode -> AvalancheRenderer) ---
+    if (auto* particles = find_node<nodes::ParticleRenderNode>()) {
+        auto& view = particles->renderer_settings();
+        ImGui::Checkbox("3D particles", &view.enabled);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Draws every particle as a small sphere on the map, lit like the terrain.\n"
+                              "It replaces the 2D density overlay, which comes back when this is off.");
+        if (view.enabled) {
+            ImGui::SameLine();
+            int colour = int(view.colour_mode);
+            ImGui::SetNextItemWidth(110 * ui::UI_SCALE);
+            if (ImGui::Combo("##particle_colour", &colour, "Snow\0Speed\0"))
+                view.colour_mode = webgpu_engine::AvalancheRenderer::ColourMode(colour);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Speed: viridis from 0 to %.0f m/s.", double(view.speed_max));
+            ImGui::Checkbox("Flow surface", &view.surface);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("A snow blanket over the dense part of the flow: the particles' volume spread with the\n"
+                                  "solver's B-spline, drawn where it is at least as deep as %u particles over 3x3 grid\n"
+                                  "columns. Particles above it and in thin parts stay visible as the front and spray.",
+                    view.surface_min_count);
+            ImGui::SameLine();
+            if (ImGui::Button("Look at the flow"))
+                look_at_flow(*solver, 400.0);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Moves the camera to 400 m from the snow's centre of mass, steeply from the south.");
+            if (view.surface) {
+                ImGui::Checkbox("Track", &view.track);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("A thin, duller layer wherever the flow has been since the release (its peak depth,\n"
+                                      "like AvaFrame's peak flow thickness): the path stays visible where the flow has\n"
+                                      "thinned out or moved on. Cleared by Reset.");
+                ImGui::SameLine();
+            }
+            ImGui::Checkbox("Snow cover", &view.snow_cover);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Snow on the terrain around the avalanche, lit like the terrain: a screen-space snow\n"
+                                  "overlay that leaves the avalanche's own pixels alone. Snow line and slope limits are\n"
+                                  "in the Overlays panel (\"Avalanche snow cover\").");
+            if (view.surface) {
+                int refine = int(view.surface_refine);
+                if (ImGui::SliderInt("Surface detail", &refine, 1, 4, "%dx the grid"))
+                    view.surface_refine = uint32_t(refine);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Render grid of the blanket, finer than the solver's grid. The snow is spread at the\n"
+                                      "solver's resolution, so finer steps only draw the same field more smoothly.");
+            }
+            using Shape = webgpu_engine::AvalancheRenderer::Shape;
+            int shape = int(view.shape);
+            if (ImGui::Combo("Particle shape", &shape, "Spheres\0Strain-rate ellipsoids\0Powder (transparent)\0"))
+                view.shape = Shape(shape);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Ellipsoids stretch each particle along its current strain rate (the symmetric part of\n"
+                                  "its velocity gradient): elongated where the flow stretches or shears, flattened where it\n"
+                                  "compacts. They show what the flow does now, not how far it has deformed.\n"
+                                  "Powder draws each particle as a large, soft, cloudy, transparent blob: a haze over the\n"
+                                  "flow surface that shows where snow is airborne or thin, while the surface carries the mass.");
+            if (view.shape == Shape::Powder) {
+                ImGui::SliderFloat("Powder size", &view.powder_size, 1.0f, 10.0f, "%.1f x spacing");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Blob radius as a multiple of the particle spacing. Larger blobs merge into a cloud\n"
+                                      "but cost more (each covers more pixels).");
+                ImGui::SliderFloat("Powder opacity", &view.powder_opacity, 0.02f, 1.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Alpha at a blob's centre; it falls off towards the edge and is broken up by noise.");
+            } else {
+                ImGui::SliderFloat("Particle size", &view.radius_scale, 0.2f, 2.0f, "%.2f x spacing");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Sphere radius as a share of the particle spacing (the release volume per particle).");
+                static constexpr uint32_t CHILD_COUNTS[] = { 1u, 8u, 27u };
+                int children = int(std::find(std::begin(CHILD_COUNTS), std::end(CHILD_COUNTS), view.children) - std::begin(CHILD_COUNTS));
+                if (ImGui::Combo("Detail particles", &children, "1 per particle\0" "8 per particle\0" "27 per particle\0"))
+                    view.children = CHILD_COUNTS[std::clamp(children, 0, 2)];
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Rendering only: each simulated particle is drawn as several smaller ones scattered within\n"
+                                      "two radii of it, with the same total volume. The detail is invented, not simulated; the\n"
+                                      "clusters move with their particle and merge back into it from afar. 27 is heavy on\n"
+                                      "integrated GPUs.");
+            }
+            if (view.shape == Shape::StrainRate) {
+                ImGui::SliderFloat("Strain window", &view.strain_window, 0.02f, 1.0f, "%.2f s", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("How long the current strain rate acts on the shape. Longer shows weaker strain;\n"
+                                      "each axis is capped at +/-70 %%.");
+            }
+        }
+        ImGui::Separator();
+    }
 
     // --- Playback speed and detail ---
     if (ImGui::Combo("Pacing", reinterpret_cast<int*>(&m_pacing), "Manual\0Smooth (60 fps)\0Balanced (30 fps)\0Fast simulation\0"))

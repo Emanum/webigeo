@@ -230,6 +230,166 @@ Each batch run now sets 0.8 × CFL for its own grid, and all MPM runs were redon
 - **First draft corrected:** it called that pattern a size effect, but avaHit (268 000 m³) fits
   at 0.55. The doc now relates it to com1DFA's travel angle instead.
 
+### 13. Rendering research and plan, new worktree branch (2026-10-18)
+
+**Request:** start a worktree branch for the rendering ("Partikelsystemrendering, potentiell
+aggregierte Partikel"), research MPM and particle rendering, report with options, link in
+Notion.
+
+**Done:**
+- Worktree `.claude/worktrees/mpm-rendering` on branch `worktree-mpm-rendering`, from main
+  (`836dbcec`).
+- Report [Avalanche Particle Rendering](https://claude.ai/artifact/PWiuxTHUn9LvobGEQpksXj),
+  linked on the Notion rendering page and the overview.
+- Plan in `mpm-mls-doc/12-rendering-plan.md`.
+
+**Decision proposed:**
+- G-buffer geometry, so the avalanche is lit like the terrain.
+- Sphere impostors, then ellipsoids from the deformation gradient F (PhysGaussian's covariance
+  idea).
+- A draped flow surface aggregated per grid column (as Vicari et al. 2025 do for GIS).
+- Transparent powder later.
+- Not chosen: marching cubes (grid too coarse) and screen-space triangulation.
+
+**Sources:** some were read through search summaries only (the WebGPU-Ocean write-up blocked
+direct access); the report says which.
+
+**Implemented the same day: steps 1–2 (plumbing, sphere impostors).** The user asked to start
+and allowed edits to existing files. Details are in `mpm-mls-doc/12-rendering-plan.md`
+("Status").
+
+- **Solver:** `MpmParticleView` (a "particle view" output).
+- **App:** a `ParticleRenderNode`.
+- **Engine:** `AvalancheRenderer` and `render_avalanche.wgsl`, drawn in the G-buffer pass.
+- **Panel:** the "3D particles" controls.
+- **Validator:** `validate_wgsl.py` extended to engine shaders.
+
+**Worktree build:** `extern` is symlinked to the main checkout's (prebuilt Dawn, sources that
+include `extern/...`). Do not commit the symlink.
+
+**Verified:**
+- tint validates all shaders.
+- The macOS debug build compiles.
+- A sandbox batch run on avaKot (25 s) shows the lit particles at the front on the map, with
+  no WebGPU errors.
+- Prefs and `imgui.ini` were restored, and the test run folder was deleted.
+
+**Not verified:** the web build, a close-up.
+
+**Map mode is the target** (user, same day). The node was removed from the sandbox preset.
+
+**Map-mode verification:** Hintertux at 132 s, lit particle deposit and release. It used a
+temporary test build without the first-run notice; the preset was restored and rebuilt.
+
+**Step 3, strain-rate ellipsoids, done the same day.**
+- **The plan's premise was wrong:** the solver stores only the elastic F, about 1 % for snow, so
+  F-ellipsoids would look like spheres. The user chose the strain-rate variant (from C).
+- **Added:** a "Look at the flow" camera button.
+- **Verified:** Hintertux at 77 s shows stretched moving particles, through a temporary
+  auto-framing test build that was reverted.
+
+**Step 4, flow surface, done the same day.**
+- **Design:** bin → depth (solver terrain) → draped grid mesh with 3×3 smoothing and a 5 cm
+  contour.
+- **First attempt:** used the lowest particle as "ground"; it cut into slopes and looked blocky.
+  Replaced by the depth pass.
+- **Verified:** Hintertux at 74 s, via a temporary test build that was reverted.
+- **Open:** isolated small patches.
+
+**Fixes after step 4 (user):**
+- **Patches:** a 3×3 neighbourhood count of at least 8 is needed for a column to join the
+  surface.
+- **Overlay:** the 2D density overlay is hidden while the 3D particles are on, through a new
+  `Overlay::enabled`. The ping-pong chain uses only the enabled overlays.
+- **Verified:** with the temporary test build, reverted afterwards.
+
+**Approach that failed:** posting a click to the app's process (`CGEvent.postToPid`) does not
+reach SDL in the background. I did not move the user's real mouse.
+
+**Detail particles (2026-10-23, branch `mpm-rendering`, uncommitted).** The user reported a
+flickering, aliased flow surface and particles that look out of place because there are too
+few.
+- **Literature:** Stomakhin 2013 never shows particles; it rasterises them with the B-spline
+  kernels and path-traces a volume (0.3–7.2 M particles). Hu 2018 describes no rendering.
+- **The user chose both fixes:** render-only child particles first, then a mass-splat flow
+  surface.
+- **Children:** K per particle (1 / 8 / 27, default 8). Offsets are hash-stable, the radius is
+  scaled by K^(-1/3), and the children are scattered within 2 parent radii. They fade back
+  into the parent below about 3 px. Details are in `12-rendering-plan.md`, step 5.
+- **Two layouts were rejected after an A/B screenshot.**
+  - The volume-equivalent ball (0.62 spacing) made the clusters smaller than single particles.
+  - Packing the children into the parent's own sphere made them read as clods.
+- **Verified** with a temporary test build: paused at 40 s, camera at 150 m, the same frame
+  rendered with 8 and with 1.
+- **Test trap:** the app redraws only on change. Switching a setting from code while paused
+  needs a camera nudge to show up; the UI combo triggers the redraw itself.
+- **Test runs** set `startup.autoplay` temporarily, inside the prefs backup and restore.
+- **Temporary test patches** were reverted from the pre-patch copies and the build was
+  re-run.
+
+**Mass-splat flow surface (same day, uncommitted).** It replaces the per-column binning. Details
+are in `12-rendering-plan.md`, step 6.
+- **Splat:** a B-spline splat at the solver's dx onto a 3× finer render grid (shaders renamed
+  bin → splat, depth → field).
+- **Depth:** volume / area decides where the blanket is drawn.
+- **Height:** 2 × the mean particle height + radius, tapered at the edge.
+- **First attempt:** the volume depth alone. The blanket sat at release density under a looser
+  moving flow, and the particles speckled through it everywhere. Hence the height term.
+- **Verified:** the paused A/B at 3× vs 1× (smooth vs faceted outline) and a burst during
+  playback (no popping).
+- **Open:** GPU time not measured; the web build is not tested.
+
+**Gaps over bumps: diagnosis, then track and snow cover (same day, uncommitted).** Details are
+in `12-rendering-plan.md`, step 7.
+- **Diagnosis:** the same paused frame, with and without the airborne cut-off and with a
+  one-particle threshold. The holes stayed, so they are real: no particles within 12 m. They are
+  not a rendering threshold.
+- **B, track:** a persistent peak depth per render node, cleared on solver reset (new
+  `MpmParticleView::reset_count`). It draws a 0.3 m duller layer where the flow has been.
+- **A, snow cover:** `ParticleRenderNode` owns a pre-shading (lit) `ScreenSpaceSnowOverlay`.
+  The avalanche writes a marker into the G-buffer overlay slot, which the snow overlay skips.
+- **Test trap 1:** setting the same camera again does not redraw. Nudge the distance (800,
+  800.5, 801 m) when switching settings while paused.
+- **Test trap 2:** log the stage switches (`qWarning`) and match them to the capture
+  timestamps. The time to reach a given simulated time varies by several seconds between
+  runs.
+- **Validator:** now also checks `overlays/screen_space_snow`; temporary files for nested
+  names are flattened.
+- **Requested by the user:** future rendering options (screen-space fluid rendering and others)
+  documented in Notion.
+
+**Powder particles (same day, uncommitted).** The user's idea: particles rendered like gas, large,
+dense in the middle and sparse outside, as a guide over the surface. Mid-turn the user added: a
+noise texture shifted per particle. Details are in `12-rendering-plan.md`, step 8.
+- **Shape:** a third particle shape, `Shape::Powder`.
+- **Pass:** transparent, after compose, on the track-line pattern. No sort is needed for
+  same-coloured premultiplied "over" blending.
+- **Soft intersection** via the G-buffer depth.
+- **Noise:** procedural per-particle value noise instead of a texture asset (same effect, nothing
+  to load).
+- **Verified** on one paused frame, A/B against the ellipsoids. GPU cost not measured.
+
+**Powder default 8× spacing (user), committed with the powder particles. Snow cover thinning
+with altitude (same day, uncommitted).** The user asked for less snow lower down, then
+mid-turn: "possibly also just more sparse with a noise texture".
+- **Snow line:** the avalanche's snow cover fits it to the solver's terrain scan: full above
+  55 % of the relief, none at 15 % below the lowest point.
+- **Patches:** a new `patches` setting on the screen-space snow overlay turns the falloff into a
+  covered share drawn as world-space noise patches, instead of translucency.
+- **Verified:** an overview and a close-up of Hintertux.
+
+**Powder is now the default particle shape** (user). `Settings::shape` = Powder; the map preset
+sets no shape, so it applies there.
+
+**Docs brought up to date, towards main (same day).** The other session's docs fixes (PR #10,
+branch `claude/dreamy-sagan-1uw3da`) were merged into `mpm-rendering`.
+- `README` (doc table, pipeline, status), `02-files-and-api` (rendering files, modified engine
+  files, the `particle view` output, panel 3D controls), `03-shaders` (rendering shaders),
+  `06-verification` §5b (rendering checks; §5 now points at the AvaFrame comparison),
+  `12-rendering-plan` status.
+- Merging PR #10 into main from here was refused by the permission check (merge without
+  review). Left for the user.
+
 ### 12. Entrainment research: a snow cover made of particles (2026-10-12)
 
 **Request:** assess the idea of seeding particles along the whole path, held by friction and
