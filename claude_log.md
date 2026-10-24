@@ -13,6 +13,81 @@ capture of the terminal.
 
 ---
 
+## 2026-10-24
+
+### 1. Generic simulation driver: real time and accuracy playback (branch `simulation-driver`)
+
+Asked: replace the panel-driven stepping with a generic solution that fits other simulations
+(an interface, like the node graph), and a "cinema" mode that runs on frame time like a game
+engine, keeping today's accuracy pacing for the sandbox. Plan clarified first (Notion ticket
+"Generic simulation driver: real-time and accuracy clocks"): interface in `webgpu_compute`,
+app-level driver, fixed-step accumulator that falls behind rather than change `dt`, map real
+time / sandbox accuracy with a switch, 0.1–4x, no interpolation, Pacing as the budget.
+
+Built: `TimeSteppedSimulation` (interface, owns a `SimulationClock`), `SimulationClock`
+(accuracy = the old `apply_pacing`; real time = debt accumulator), `SimulationDriver` (ticked
+from `ImGuiManager::render()`, also with the GUI hidden), `MpmSolverNode` implements it,
+`AvalanchePanel` only controls the clock. Write-up: `mpm-mls-doc/13-simulation-driver.md`.
+
+**Three wrong turns, each found by measuring** (temporary per-second log harness, reverted):
+- Real-time runs of two chained chunks put both into one frame and none into the next:
+  **30 frozen frames per second** at 1x, i.e. 30 Hz motion. Fix: `Submission::PerFrame`,
+  one chunk per frame from the driver, an 8-frame run, the run done once its last chunk is
+  submitted (the readback map waits for the GPU anyway), so runs follow each other without a gap.
+- The integer chunk floor(6 ms / 1.7 ms) = 3 steps could not reach the 3.3 steps per frame of
+  1x: budget in fractional steps over the run.
+- Per-frame chunks measure 1.5–3 ms per step where accuracy chunks measure 0.8 ms on the same
+  flow (at 1x and 2x the GPU time per frame was the same ~9.5 ms: it looks like the GPU clocks
+  down under light load; not proven). Budgeting with the average fed back down to 0.5x; a best
+  cost that relaxed upward still decayed to 0.58x over 50 s. Final: the best cost since the
+  reset, with GPU backpressure (three chunks in flight → the frame's chunk is skipped) as the
+  real overload guard.
+
+**Verified:** unit tests (17 sections, fake simulation; removing the run cap fails them).
+On the M5, map Hintertux, Medium: 1x Smooth 0.98–1.01x throughout, 56–60 fps, 0 frozen
+frames; 4x Smooth steady 2.64x flagged behind, 60 fps; GUI hidden keeps it running. Accuracy
+unchanged: batch avaKot Stomakhin Coulomb at rest after 80.25 s vs 79.60 s in phase 6, same
+footprint and peak speed. Phase-2 commit builds on its own; web build compiles.
+**Not verified:** the web build in a browser; the playback controls were only seen in a
+screenshot, not clicked (Pause draining a run is unit-tested only).
+
+Also found by review: pausing mid-run would have left a PerFrame run unfinished forever
+(Step, Reset and graph runs queued behind it); the clock now drains it while paused.
+
+Test runs backed up and restored the prefs (`defaults delete` + `import`, since `import`
+alone keeps added keys) and `imgui.ini`; one test export in `avaKot/mpm` was deleted again.
+Mistake on the way: a zsh loop did not split `$cfg` (the same trap as before) and ran four
+tests with empty prefs; only scratchpad files were affected, rerun under `bash -c`.
+
+### 2. Interpolation for real-time playback (same branch, PR #12)
+
+Asked: "add interpolation". Clarified: real time only, an "Interpolate" checkbox on by default,
+same branch. Design (game-engine style, Fiedler's "Fix your timestep!"): the clock keeps a
+presentation time T; each frame runs just enough steps to be at or past T, in one chunk
+(`advance_frame()`); the renderer draws positions blended between the particles before and after
+that chunk (`set_interpolation()`). The pre-planned 8-frame runs went: the clock now decides each
+frame's steps, and only closes a run every 8 chunks. The solver copies its particle buffer before
+each real-time chunk (`m_previous_particles`); the three particle shaders blend the position.
+
+**Found while measuring, more important than the interpolation itself:** the map only repaints
+on request, and `ParticleRenderNode` requested it once per solver run. So the 3D view had
+updated once per run — every 8 frames in real time — and the "0 frozen frames" of entry 1 were
+only true for the simulated time, not for the picture. The harness now counts real repaints.
+Also the driver ticked in the GUI pass, after the paint, so a frame would have drawn the new
+chunk with the old interpolation. Fixed: `App::render()` ticks before the paint and repaints
+every frame while a simulation plays.
+
+**Verified:** 23 unit test sections (forcing the interpolation to 1 fails the two drawn-time
+ones). On the M5, map Hintertux: 1x Smooth 1.00x, 60 fps, 60 repaints/s, drawn time 16.67 ±
+0.3 ms per frame, no still frame (GUI hidden for 10 s included); 0.1x: the simulation stands
+still 41 frames per second, the picture in none (41 with interpolation off); 4x Smooth 2.67x
+steady, behind, 60 fps; accuracy unchanged in behaviour (45 fps, per-run updates). Each commit
+builds on its own; web build compiles. **Not verified:** the browser; the checkbox was not
+clicked (set through the prefs in the runs).
+
+Prefs note: the per-run backup already held the user's own newer prefs (they had used the app
+in between, e.g. `startup.scenario` 4); each run restored exactly those.
+
 ## 2026-10-10
 
 ### 1. Solver in metres instead of Web Mercator units (branch `mpm-metric-units`)

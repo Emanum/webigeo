@@ -308,6 +308,29 @@ counting switched off for one run.
 **All real-terrain results before this date** (runout, speeds, the energy-line numbers on the
 Breite Ries in §4g/§4j) were on terrain flattened by ~1.47 and need re-checking.
 
+## 4l. Simulation driver — real time and accuracy (2026-10-24)
+
+Details and the full table in [13-simulation-driver.md](13-simulation-driver.md).
+
+- **Unit tests** (`unittests_webgpu_compute`, 23 sections, fake simulation): real time keeps
+  to the wall clock at 20–144 fps and 0.1–4x; with interpolation the drawn time moves exactly
+  one frame's worth every frame, also at 0.1x where the simulation itself mostly stands still;
+  a too-small budget falls behind without exceeding it and without racing to catch up; the
+  budget uses the best cost since the reset; behind has hysteresis; a stalled frame counts
+  0.25 s at most; a pause or a mode switch closes the open run; accuracy runs keep the old
+  sizes. Forcing the interpolation to 1 fails the drawn-time sections.
+- **On the M5** (map, Hintertux, Medium, `dt` 5.04 ms, 55 s per run, temporary log harness that
+  counts real repaints and the drawn time): 1x Smooth 1.00x at 60 fps and 60 repaints per
+  second, drawn time 16.67 ± 0.3 ms per frame, no still frame; 0.1x: the simulation stands
+  still in 41 frames per second, the picture in none (41 without interpolation); 4x Smooth a
+  steady 2.67x, flagged behind, 60 fps; the simulation keeps running with the GUI hidden.
+- **Found on the way:** the map repainted only when the solver finished a run, so the 3D view
+  had updated once per run (every 8 frames in real time) whatever the simulation did per frame;
+  and the driver ticked after the paint. Both fixed (tick before paint, repaint while playing).
+- **Accuracy unchanged**: batch avaKot / Stomakhin Coulomb at rest after 80.25 s (phase 6:
+  79.60 s), same footprint (12.51 ha) and peak speed (54.01 m/s).
+- Web build compiles; not run in the browser.
+
 ## 5. On real terrain
 
 Runs end to end on the Schneeberg DEM: seeds, flows downhill, deposits, animates, and the
@@ -361,7 +384,9 @@ Worth keeping — they are the interesting part of the implementation story.
 
 3. **Animation stopping.** Stepping was driven from the node editor's settings panel, which
    only renders while that editor is open *and* the node selected. Moved to
-   `AvalanchePanel::draw()`, which runs every frame regardless of panel visibility.
+   `AvalanchePanel::draw()`, which runs every frame regardless of panel visibility — but not
+   with the GUI hidden. Since 2026-10-24 `SimulationDriver` steps it from
+   `ImGuiManager::render()` (§4l).
 
 4. **Normalized coordinates drifting.** Domain/release positions as region fractions moved
    relative to the ground whenever tile snapping changed the region. Switched to lat/lon,
