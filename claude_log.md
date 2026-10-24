@@ -88,6 +88,48 @@ clicked (set through the prefs in the runs).
 Prefs note: the per-run backup already held the user's own newer prefs (they had used the app
 in between, e.g. `startup.scenario` 4); each run restored exactly those.
 
+### 3. AvaFrame release areas on the map (branch `avaframe-map-release`)
+
+Asked: give the map's real-time ("cinematic") AvaFrame scenarios the actual AvaFrame release
+areas, as in the sandbox; an approximation is fine since the coordinate systems differ; document
+it on a Notion page. Clarified: disc as fallback without the data, AvaFrame areas without the map's
+slope mask, AvaFrame's per-cell depth, a picker (only avaGar has several scenarios).
+
+Built: `load_sandbox_terrain()` (the sandbox's dataset loading, factored out);
+`AvaFrameReleaseNode` with `resample_release()` (region texel → world → inverse of the dataset's
+affine placement → nearest AvaFrame cell); a `ReleaseArea` socket type; the solver's optional
+"release area" input switches it to the sandbox's release grid mode on the map; the map graph
+preset gets the node; the panel configures it per scenario, shows which release is used, and
+offers the picker. Write-up: `mpm-mls-doc/14-avaframe-release-on-map.md` with a figure
+(`avaframe/tools/map_release_figure.py`).
+
+**Verified:** unit tests for the resampling. On the device, the five scenarios: volume on the map
+within 0.1 % of the dataset's; centroids within half a metre of the pyproj centroids the old discs
+were placed on (Madlein differs by design: its disc sat on the largest of three areas); all
+particles seeded, none outside the domain; disc fallback with an empty dataset folder.
+**Not verified:** the picker click; how much the map's terrain under the release differs from
+AvaFrame's DEM; the browser.
+
+A screenshot of the released particles did not help (from the framing distance they cannot be
+told from the snow cover); the figure is drawn from the datasets instead, which the volume and
+centroid checks tie to what the map releases.
+
+### 4. Crash: map mode, then the sandbox, then a dataset switch (PR #14)
+
+Reported by Manuel. Two crash reports (14:24, before the map-release work, and 15:04), both
+`EXC_BAD_ACCESS` in `TextureOverlay::draw` with different small addresses: a use-after-free, not a
+null. Cause: `OverlayRenderNode` linked its overlay by raw pointer when it ran; the graph runs its
+nodes as one chain in topological order (sandbox → solver → map overlay), so after a dataset
+switch the sandbox node had replaced its map texture while the overlay relinked only once the
+solver's run had finished, frames later. Fix: the overlay asks a callback for the texture every
+frame (`link_texture_source`, reading the node's input socket), and overlays without a texture
+are left out of the ping-pong chain (`can_draw`). Reproduced with a temporary harness (map,
+sandbox, three dataset switches): crashed on the first switch before, survives all three after, on
+main and on this branch. Own branch `fix-overlay-texture-link` from main, merged into this one.
+
+Mistake on the way: an edit script re-opened `TextureOverlay.cpp` for writing before reading it
+and emptied the file; the link error showed it, restored from git.
+
 ## 2026-10-10
 
 ### 1. Solver in metres instead of Web Mercator units (branch `mpm-metric-units`)
