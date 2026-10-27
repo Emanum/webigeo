@@ -25,6 +25,12 @@
 //
 // With entrainment, also the snow cover of each column's cell (the dx x dx square around the
 // node), 4 x 4 samples of cover_depth_at(): what the flow can pick up there (column_stats.cover).
+//
+// References: none for the band (project design, mpm-mls-doc/04-data-layout.md). The cover is
+// com1DFA's entrainable snow:
+//   Tonnel 2023     M. Tonnel et al., "AvaFrame com1DFA (v1.3): a thickness-integrated
+//                   computational avalanche module - theory, numerics, and testing",
+//                   Geosci. Model Dev. 16, 7013-7035, 2023.
 
 @compute @workgroup_size(16, 16, 1)
 fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -40,11 +46,13 @@ fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
     atomicMin(&state.min_altitude_cm, altitude_cm);
     atomicMax(&state.max_altitude_cm, altitude_cm);
 
+    // Two layers of margin below the surface hold the 1.5-cell stencil of a particle on it.
     column_floor[column_index(vec2i(id.xy))] = i32(floor(altitude / settings.dx)) - COLUMN_FLOOR_MARGIN;
 
     if settings.entrainment_mode == ENTRAINMENT_OFF || settings.cover_mode == COVER_NONE {
         return;
     }
+    // The release cells hold no cover: their snow is the release (com1DFA removes the overlap too).
     var cover = 0.0; // [m^3]
     for (var i = 0u; i < 4u; i++) {
         for (var j = 0u; j < 4u; j++) {
