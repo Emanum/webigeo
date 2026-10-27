@@ -13,6 +13,43 @@ capture of the terminal.
 
 ---
 
+## 2026-10-27
+
+### 1. Paper references checked against the PDFs
+
+The MPM shader report (Notion) and its 15 sub-pages now cite section, equation, table and
+PDF page for every reference. Each one was checked against the text extracted from the PDFs
+in the iCloud folder `Tu/VisComp/avalacheSim/`. The report's Papers table lists every PDF in
+the folder, with its subfolder and use.
+
+Corrections that change content, not just precision:
+- **Hu 2018:** the force with ∂Ψ/∂F Fᵀ is §3.4 Eq. 18 (p. 146:7), not §4. §4 is the step
+  list. The article number is 146, not 150 (fixed in `refs.md`).
+- **Wolper 2019 q:** §6.1 writes q = √((6−d)/2)‖ŝ‖, which is √(3/2)‖s‖ in 3D, the same as
+  Gaume. The audits had dropped the square root and claimed a √1.5 rescaling of M. Fixed in
+  `01-theory.md` and `refs.md`; a dated correction note was added to both audit reports.
+- **Stomakhin collisions:** Stomakhin collides particle velocities *before* the position
+  update (§4.1 step 9). Our G2P resolves contact after advection and projects the position.
+  The shader page now names this as a deliberate deviation.
+- **Voellmy:** no PDF in the folder states the law. The com1DFA paper does not mention it.
+- **Li 2021 Fig. 5:** shows the elastic/plastic particle distributions. The plastic ratios
+  are compared in the text on p. 7.
+- **Stale ⚠️ notes removed:** doc items 1, 2, 4, 5 and 11 are already fixed in the code and docs.
+
+Verified: every number is from the extracted PDF text (pypdf). Not verified: the
+screenshots, which are still the user's step.
+
+### 2. Paper references in the WGSL shaders
+
+Each MPM shader now lists its papers in the header comment, and the code cites section,
+equation and PDF page at the line that implements them, using the numbers checked in
+request 1. Comments only: the shaders minus comments are identical, and tint validates all
+of them. Committed on `main`, because the docs and comments are needed there before
+entrainment can merge. `main` was then merged into `entrainment`. The script that inserts the
+comments also covers the entrainment-only code (`entrain_column()`, the cover in
+`mpm_prepare`, the particle pool), so the conflicts were resolved with its output on the
+entrainment shaders.
+
 ## 2026-10-25
 
 ### 1. Rendering doc: from plan to description
