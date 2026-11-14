@@ -91,22 +91,6 @@ namespace {
         return entry;
     }
 
-    /* The resource registry keeps every pipeline factory it is given, forever, and calls all
-     * of them again on a shader reload (F5). A node that registered `[this]` would leave a
-     * dangling factory behind each time a graph is replaced - which the avalanche autostart
-     * does on every launch. So the solver registers one factory per registry, which recreates
-     * the pipelines of whichever solver instances are alive at that moment. */
-    struct PipelineRegistration {
-        bool registered = false;
-        bool device_ready = false; // the registry has called us at least once, i.e. it has a device
-        std::vector<MpmSolverNode*> instances;
-    };
-    std::unordered_map<const webgpu::RenderResourceRegistry*, PipelineRegistration>& pipeline_registrations()
-    {
-        static std::unordered_map<const webgpu::RenderResourceRegistry*, PipelineRegistration> registrations;
-        return registrations;
-    }
-
     WGPUBindGroupLayoutEntry texture_entry(uint32_t binding, WGPUTextureSampleType sample_type)
     {
         WGPUBindGroupLayoutEntry entry {};
@@ -244,21 +228,10 @@ MpmSolverNode::MpmSolverNode(webgpu::Context& ctx, const MpmSolverSettings& sett
         m_no_cover_texture->texture().write(ctx.queue(), nucleus::Raster<float>(glm::uvec2(1), 0.0f));
     }
 
-    // See PipelineRegistration: one factory per registry, shared by all solver instances.
-    auto& registration = pipeline_registrations()[&reg];
-    registration.instances.push_back(this);
-    if (!registration.registered) {
-        registration.registered = true;
-        const webgpu::RenderResourceRegistry* key = &reg;
-        reg.register_pipeline([key](WGPUDevice device, const webgpu::RenderResourceRegistry& registry) {
-            auto& entry = pipeline_registrations()[key];
-            entry.device_ready = true;
-            for (MpmSolverNode* instance : entry.instances)
-                instance->create_pipelines(device, registry);
-        });
-    } else if (registration.device_ready) {
-        create_pipelines(ctx.device(), reg);
-    }
+    // The handle unregisters the factory when the node is destroyed, so a shader reload (F5)
+    // never calls into a solver of a replaced graph.
+    m_pipeline_registration = reg.register_pipeline(
+        [this](WGPUDevice device, const webgpu::RenderResourceRegistry& registry) { create_pipelines(device, registry); });
 }
 
 MpmSolverNode::~MpmSolverNode()
@@ -266,8 +239,6 @@ MpmSolverNode::~MpmSolverNode()
     *m_alive = nullptr; // in-flight callbacks now find the node gone
     if (m_timestamp_queries != nullptr)
         wgpuQuerySetRelease(m_timestamp_queries);
-    auto& instances = pipeline_registrations()[&m_ctx->resource_registry()].instances;
-    instances.erase(std::remove(instances.begin(), instances.end(), this), instances.end());
 }
 
 void MpmSolverNode::create_pipelines(WGPUDevice device, const webgpu::RenderResourceRegistry& reg)
