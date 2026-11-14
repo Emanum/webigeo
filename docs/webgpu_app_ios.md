@@ -150,13 +150,9 @@ cmake --build --preset webgpu_app_ios -- CODE_SIGNING_ALLOWED=NO
 
 ### Logs
 
-An iOS app has no terminal, and `devicectl --console` showed nothing. For now `main.cpp`
-redirects stdout and stderr to `Documents/webigeo.log` in the app's container (marked
-`TEMP-IOS-DIAG`). Copy it off the phone with:
-
-```bash
-xcrun devicectl device copy from --device <device id> --domain-type appDataContainer --domain-identifier dev.emanum.webigeo --source Documents/webigeo.log --destination webigeo.log
-```
+An iOS app has no terminal, and `devicectl --console` showed nothing. The app's own output is
+visible when it is run from Xcode (its debug console). On a device without Xcode attached there is
+no log; the diagnostic redirect of stdout/stderr to a file used while porting has been removed.
 
 Crash reports: list them with `xcrun devicectl device info files --device <device id> --domain-type systemCrashLogs`
 and copy one with `copy from --domain-type systemCrashLogs --source <name>.ips`. The `.ips` file

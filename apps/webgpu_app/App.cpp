@@ -170,13 +170,6 @@ void App::poll_events()
     int event_count = 0;
     static SDL_Event event;
     while (SDL_PollEvent(&event)) {
-#ifdef ALP_PLATFORM_IOS
-        { // TEMP-IOS-DIAG: which SDL events arrive, especially what ends the loop
-            static int logged = 0;
-            if (logged++ < 300 && event.type != SDL_FINGERMOTION && event.type != SDL_MOUSEMOTION)
-                qInfo() << "SDL event" << Qt::hex << event.type << Qt::dec << "window event" << (event.type == SDL_WINDOWEVENT ? int(event.window.event) : -1);
-        }
-#endif
         m_gui_manager->on_sdl_event(event);
         if (event.type == SDL_QUIT) {
             m_window_open = false;
@@ -478,7 +471,6 @@ void App::start()
         poll_events();
         render();
     }
-    qInfo() << "main loop ended"; // TEMP-IOS-DIAG
 #endif
 
     // NOTE: Ressources are freed by the browser when the page is closed. Also keep in mind
