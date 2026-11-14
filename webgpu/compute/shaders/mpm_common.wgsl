@@ -19,11 +19,28 @@
 // Shared declarations for the MLS-MPM snow solver (Hu et al. 2018, Stomakhin et al. 2013).
 // Every MPM kernel includes this file, so all of them declare the identical binding set
 // and can therefore share a single bind group layout / bind group.
+//
+// References (sections, equations and pages as in the PDFs; full list in mpm-mls-doc/refs.md):
+//   Hu 2018         Y. Hu et al., "A moving least squares material point method with displacement
+//                   discontinuity and two-way rigid body coupling", ACM TOG 37(4), Art. 146, 2018.
+//   Jiang 2015      C. Jiang et al., "The affine particle-in-cell method", ACM TOG 34(4), Art. 51,
+//                   2015.
+//   Stomakhin 2013  A. Stomakhin et al., "A material point method for snow simulation",
+//                   ACM TOG 32(4), Art. 102, 2013.
+//   Klar 2016       G. Klar et al., "Drucker-Prager elastoplasticity for sand animation",
+//                   ACM TOG 35(4), Art. 103, 2016.
+//   Li 2021         X. Li et al., "Three-dimensional and real-scale modeling of flow regimes in
+//                   dense snow avalanches", Landslides 18, 2021.
+//   Tonnel 2023     M. Tonnel et al., "AvaFrame com1DFA (v1.3): a thickness-integrated
+//                   computational avalanche module - theory, numerics, and testing",
+//                   Geosci. Model Dev. 16, 7013-7035, 2023.
 
 // ---------------------------------------------------------------------------------------
 // Coordinate conventions
 // ---------------------------------------------------------------------------------------
-// * particle.position.xy  world meters, relative to the min corner of the region aabb.
+// * particle.position.xy  metres on the ground, relative to the min corner of the region aabb.
+//                         Not world units: those are Web Mercator, 1/cos(latitude) times too
+//                         long; MpmSolverNode converts (update_gpu_settings).
 // * particle.position.z   absolute altitude in meters (same units as the height texture).
 // * texture uv            u grows with +x, v grows with -y (matches avalanche_trajectories_compute).
 // * grid space            (position - domain origin) / dx horizontally; vertically plain
@@ -38,7 +55,7 @@ struct MpmSettings {
     domain_size_xy: f32, // horizontal edge length of the domain in meters
     dx: f32, // grid spacing in meters (domain_size_xy / grid_res.x)
 
-    region_size: vec2f, // world size of the whole region in meters
+    region_size: vec2f, // size of the whole region in metres (converted from world units)
     height_texture_dim: vec2u,
 
     dt: f32,
@@ -77,25 +94,72 @@ struct MpmSettings {
     ccc_beta: f32, // Cam-Clay: cohesion, tensile strength = beta p0
     ccc_xi: f32, // Cam-Clay: hardening factor (brittleness)
     ccc_p0_initial: f32, // Cam-Clay: initial consolidation pressure [Pa]
+
+    release_mode: u32, // RELEASE_DISC or RELEASE_GRID, see mpm_seed.wgsl
+    release_volume: f32, // [m^3], RELEASE_GRID only
+    release_max_depth: f32, // [m], RELEASE_GRID only
+    release_half_y: f32, // half height of the release bounds [m]; release_radius is the half width
+
+    // Entrainment (see entrain_column() in mpm_grid_update.wgsl). Particles [0, release_particles)
+    // are the release; [release_particles, num_particles) a pool the entrained snow is drawn from.
+    entrainment_mode: u32, // ENTRAINMENT_OFF, _PLOWING or _EROSION
+    cover_mode: u32, // COVER_NONE, COVER_TEXTURE or COVER_UNIFORM
+    release_particles: u32,
+    pool_particles: u32,
+
+    cover_thickness: f32, // COVER_UNIFORM: slope-normal thickness [m]
+    cover_cos_max_slope: f32, // COVER_UNIFORM: no cover on slopes steeper than this
+    cover_density_ratio: f32, // density of the cover / density of the flowing snow
+    erosion_energy: f32, // e_b [J/kg], EROSION
+
+    plowing_depth: f32, // [m], flow depth over a column that takes its cover, PLOWING
+    entrainment_min_speed: f32, // [m/s], slower flow picks nothing up
+    snow_density: f32, // [kg/m^3] of the flowing snow, for the basal shear stress
+    entrainment_density: f32, // [kg/m^3] of the cover
 }
 
+// Release disc masked by the release point texture (alpha) - the map.
+const RELEASE_DISC: u32 = 0u;
+// Release depth per cell in the release texture (r, metres, vertical) - the AvaFrame sandbox.
+const RELEASE_GRID: u32 = 1u;
+
+// Entrainment law (com1DFA, Tonnel 2023 eq. 1 and 29, p. 3 and 7: a mass source q_ent; the
+// erosion and plowing laws themselves are in the com1DFA theory docs, not the paper): plowing
+// takes the whole cover at the front, erosion at the rate tau_b |u| / e_b per area.
+const ENTRAINMENT_OFF: u32 = 0u;
+const ENTRAINMENT_PLOWING: u32 = 1u;
+const ENTRAINMENT_EROSION: u32 = 2u;
+// Where the snow cover comes from: none, the entrainment texture (vertical depth per cell, the
+// AvaFrame areas), or one slope-normal thickness everywhere up to a slope.
+const COVER_NONE: u32 = 0u;
+const COVER_TEXTURE: u32 = 1u;
+const COVER_UNIFORM: u32 = 2u;
+
+// The six scalars in the vec3 padding hold the Kirchhoff stress tau = P F^T of the particle's
+// current elastic state, the dPsi/dF F^T of Hu 2018 sec. 3.4, eq. 18, p. 7 (symmetric for every
+// model here, so six components). G2P computes it from the SVD the return mapping has just done,
+// and P2G of the next substep only reads it - one SVD per particle and substep instead of two.
+// The particle volume is not stored: it is the same for every particle (settings.particle_volume,
+// mass is normalised to 1).
+// Read by code outside the solver (the avalanche renderer copies this layout): a change here bumps
+// MPM_LAYOUT_VERSION in MpmSolverNode.h and updates mpm-mls-doc/04-data-layout.md.
 struct Particle {
     position: vec3f,
     mass: f32, // 0 marks an inactive particle
     velocity: vec3f,
     plastic_state: f32, // meaning depends on the constitutive model (Stomakhin: Jp)
     c0: vec3f, // rows of the APIC affine velocity matrix C
-    volume: f32,
+    tau_xx: f32,
     c1: vec3f,
-    _p1: f32,
+    tau_yy: f32,
     c2: vec3f,
-    _p2: f32,
+    tau_zz: f32,
     f0: vec3f, // rows of the elastic deformation gradient F
-    _p3: f32,
+    tau_xy: f32,
     f1: vec3f,
-    _p4: f32,
+    tau_xz: f32,
     f2: vec3f,
-    _p5: f32,
+    tau_yz: f32,
 }
 
 // Grid quantities are accumulated with fixed point atomics because WGSL has no atomic
@@ -119,28 +183,36 @@ const MASS_SCALE: f32 = 1048576.0; // 2^20
 struct GridNode {
     mass_lo: atomic<u32>, // 64-bit fixed point mass, MASS_SCALE (carry via atomicAdd's return)
     mass_hi: atomic<u32>,
-    vx: atomic<i32>, // momentum during P2G, then velocity - MOMENTUM_SCALE
+    vx: atomic<i32>, // momentum, MOMENTUM_SCALE. Zeroed again by the grid update, which
+                     // writes the node velocity to grid_velocity as plain floats.
     vy: atomic<i32>,
     vz: atomic<i32>,
 }
 
-// Read back to the CPU after every run (see MpmSolverNode::SimStateReadback). Slots 0-2 are
-// written once per reset; slots 3-4 are zeroed by the CPU before every run.
+// Read back to the CPU after every run (see MpmSolverNode::SimStateReadback). Slots 0-2, 5
+// and the path sum are written from the reset on; the CPU zeroes the rest before every run
+// (MpmSolverNode::reset_run_counters, which skips the slots that must survive).
 struct SimState {
     min_altitude_cm: atomic<i32>,
     max_altitude_cm: atomic<i32>,
     active_particles: atomic<u32>,
     max_speed_mm: atomic<u32>,
-    plastic_particles: atomic<u32>, // particles whose plastic state has left its initial value
-    _reserved: atomic<u32>,
+    // Particles whose return mapping yielded in the last substep - an instantaneous count, like
+    // the plastic ratio of Li 2021 (Fig. 5, p. 6; ratios compared on p. 7), not "ever yielded".
+    // P2G zeroes it every substep, G2P counts.
+    plastic_particles: atomic<u32>,
+    // Seeding threads whose first random sample landed on a release point: hits / threads
+    // is the share of the release disc that got snow, i.e. the seeded area, from which
+    // seeded_particle_volume() recovers the real snow volume per particle.
+    seed_first_hits: atomic<u32>,
 
-    // Sums of position and |v|^2 over the active particles, for the centre of mass and the
-    // mean kinetic energy of the energy-line test (Tonnel et al. 2023, com1DFA section 5.2).
-    // WGSL has no 64-bit atomics, and a fixed-point sum over 10^5 particles overflows a u32
-    // at any useful precision - so each sum is a lo/hi pair: add to lo, and if the returned
-    // old value shows the add wrapped, carry into hi. All summands are non-negative
-    // (region-relative x/y, altitude, |v|^2), so unsigned is fine. See wide_add() in
-    // mpm_splat.wgsl and MpmSolverNode::read_back_state() for the two halves.
+    // Sums of position and |v|^2 over the active particles, for the centre of mass and the mean
+    // kinetic energy of the energy-line test (Tonnel 2023 sec. 5.2, p. 14; App. A eq. A4, p. 19).
+    // WGSL has no 64-bit atomics, and a fixed-point sum over 10^5 particles overflows a u32 at
+    // any useful precision - so each sum is a lo/hi pair: add to lo, and if the returned old
+    // value shows the add wrapped, carry into hi. All summands are non-negative (region-relative
+    // x/y, altitude, |v|^2), so unsigned is fine. See wide_add() in mpm_splat.wgsl and
+    // MpmSolverNode::read_back_state() for the two halves.
     sum_x_lo: atomic<u32>, // region-relative metres * SUM_POSITION_SCALE
     sum_x_hi: atomic<u32>,
     sum_y_lo: atomic<u32>,
@@ -149,17 +221,60 @@ struct SimState {
     sum_z_hi: atomic<u32>,
     sum_speed_sq_lo: atomic<u32>, // m^2/s^2 * SUM_SPEED_SQ_SCALE
     sum_speed_sq_hi: atomic<u32>,
+
+    // Horizontal distance travelled, summed over particles, since the reset - not per run, so a
+    // run whose readback is skipped loses nothing. Divided by the particle count it is the
+    // mass-averaged path s of the energy line (Tonnel 2023 App. A, eq. A4-A5, p. 19-20), which is
+    // longer than the centre of mass's own path once the flow spreads. G2P adds it.
+    sum_path_lo: atomic<u32>, // metres * SUM_PATH_SCALE
+    sum_path_hi: atomic<u32>,
+
+    // Artificial boundaries touched during the run, in particle-substeps whose stencil reached
+    // the nodes where the grid update stops outward flow (or that got clamped outright): the
+    // ceiling of the terrain-following band and the walls of the domain box. Nonzero means the
+    // result depends on the box, not only on the physics - more layers or a larger domain.
+    ceiling_contacts: atomic<u32>,
+    wall_contacts: atomic<u32>,
+
+    // Entrainment, from the reset on: the cover in the domain (mpm_prepare, in COVER_VOLUME_SCALE
+    // units of cover volume), the pool slots handed out to entrained snow so far (can run past
+    // the pool), and the cover volume the flow could not take because the pool was used up.
+    cover_volume: atomic<u32>,
+    entrained_particles: atomic<u32>,
+    pool_exhausted: atomic<u32>, // COVER_VOLUME_SCALE units
 }
+const COVER_VOLUME_SCALE: f32 = 100.0; // 0.01 m^3; 4e7 m^3 of cover still fit a u32
 
 // Per-particle contributions have to fit a u32 on their own: 4500 m * 1e4 = 4.5e7 and
 // (100 m/s)^2 * 1e5 = 1e9 both do. The sums are 64-bit, so particle count is irrelevant.
 const SUM_POSITION_SCALE: f32 = 1.0e4; // 0.1 mm
 const SUM_SPEED_SQ_SCALE: f32 = 1.0e5; // 1e-5 m^2/s^2
+// Per substep a particle moves a few cm (dt * speed); G2P first sums a workgroup's 256
+// particles in a u32, with each capped at 100 m: 256 * 100 m * 1e5 = 2.6e9 still fits.
+const SUM_PATH_SCALE: f32 = 1.0e5; // 0.01 mm
+
+// Real snow volume one particle stands for [m^3]. Not settings.particle_volume: mass is
+// normalised to 1 per particle and the volume scaled with it, which leaves the MPM equations
+// unchanged but makes that volume meaningless as a length scale. The slab's real volume is
+// the seeded area times its thickness, the area being the release disc times the share of
+// first seeding samples that hit a release point (Monte Carlo over every seeding thread).
+fn seeded_particle_volume() -> f32 {
+    // The release grid (the sandbox, AvaFrame areas on the map) knows its volume exactly
+    // (AvaFrame's thickness times surface area).
+    if settings.release_mode == RELEASE_GRID {
+        return settings.release_volume / max(f32(atomicLoad(&state.active_particles)), 1.0);
+    }
+    let hit_share = f32(atomicLoad(&state.seed_first_hits)) / f32(max(settings.release_particles, 1u));
+    let area = hit_share * 3.14159265 * settings.release_radius * settings.release_radius;
+    return area * settings.slab_thickness / max(f32(atomicLoad(&state.active_particles)), 1.0);
+}
 
 // Result of a constitutive model's plastic return mapping (see mpm_material.wgsl).
 struct PlasticReturn {
     f_elastic: mat3x3f,
     plastic_state: f32,
+    kirchhoff: mat3x3f, // tau = P F^T at (f_elastic, plastic_state), for the next P2G
+    yielded: bool, // the trial state was outside the admissible set and got projected
 }
 
 @group(0) @binding(0) var<uniform> settings: MpmSettings;
@@ -171,6 +286,30 @@ struct PlasticReturn {
 @group(0) @binding(6) var<storage, read_write> density_raster: array<atomic<u32>>;
 @group(0) @binding(7) var output_texture: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(8) var<storage, read_write> column_floor: array<i32>; // per (x, y) column, see grid_slot()
+@group(0) @binding(9) var<storage, read_write> grid_velocity: array<vec4f>; // per node, written by the grid update, read by G2P: xyz velocity, w node mass in units of the normalised particle mass (settings.particle_mass)
+@group(0) @binding(10) var<storage, read_write> tile_flags: array<atomic<u32>>; // per tile of columns (mark_tiles()), then the sort data (sorted_index())
+// Per (x, y) column: the peaks since the last reset, which the AvaFrame comparison exports
+// (com1DFA's peak flow thickness and velocity), and the particle sums the speed comes from.
+// mpm_column_stats adds every particle to the column of its nearest node after G2P; the next
+// grid update, which owns each column in one thread, turns the sums into the column's mean
+// particle speed and zeroes them. Without that pass (on the map) the sums stay zero and only
+// the depth is tracked.
+// Read by the avalanche renderer, which copies this layout: see struct Particle.
+struct ColumnStats {
+    peak_depth: f32, // [m], vertical: the column's (B-spline) mass as snow volume per area
+    peak_speed: f32, // [m/s], mean speed of the particles in the column
+    particles: atomic<u32>, // this substep
+    speed_sum: atomic<u32>, // this substep, [SPEED_SUM_SCALE]
+    // Entrainment: the snow cover left on the column's cell [m^3 of cover], set at the reset
+    // (mpm_prepare), and cover already eroded but not yet turned into a particle [m^3].
+    cover: f32,
+    eroded: f32,
+}
+const SPEED_SUM_SCALE: f32 = 100.0; // cm/s; 2^21 particles at 20 m/s still fit a u32
+@group(0) @binding(11) var<storage, read_write> column_stats: array<ColumnStats>;
+// Snow cover depth per cell [m, vertical] in region uv like the release texture (COVER_TEXTURE);
+// a 1x1 placeholder otherwise.
+@group(0) @binding(12) var entrainment_texture: texture_2d<f32>;
 
 // ---------------------------------------------------------------------------------------
 // Fixed point helpers
@@ -183,8 +322,11 @@ fn to_fixed(value: f32) -> i32 {
 
 fn from_fixed(value: i32) -> f32 { return f32(value) / MOMENTUM_SCALE; }
 
-fn add_node_mass(cell: u32, mass: f32) {
-    let units = u32(round(mass * MASS_SCALE));
+fn add_node_mass(cell: u32, mass: f32) { add_node_mass_units(cell, u32(round(mass * MASS_SCALE))); }
+
+// Mass already in MASS_SCALE units: P2G sums a tile's contributions in workgroup memory first.
+// Integer addition is associative, so the 64-bit total is the same either way.
+fn add_node_mass_units(cell: u32, units: u32) {
     if atomicAdd(&grid[cell].mass_lo, units) > 0xFFFFFFFFu - units {
         atomicAdd(&grid[cell].mass_hi, 1u);
     }
@@ -230,12 +372,45 @@ fn sample_height_uv(uv: vec2f) -> f32 {
 
 fn terrain_height(world_xy: vec2f) -> f32 { return sample_height_uv(world_to_uv(world_xy)); }
 
-// Upward facing terrain normal in world space, from central differences.
+// Upward facing terrain normal in world space, from central differences. This is the collider
+// normal n of Stomakhin 2013 sec. 8 (p. 6) for the terrain.
 fn terrain_normal(world_xy: vec2f) -> vec3f {
     let h = max(settings.dx, 1.0); // sample at grid scale, not at DEM scale
     let dhdx = (terrain_height(world_xy + vec2f(h, 0.0)) - terrain_height(world_xy - vec2f(h, 0.0))) / (2.0 * h);
     let dhdy = (terrain_height(world_xy + vec2f(0.0, h)) - terrain_height(world_xy - vec2f(0.0, h))) / (2.0 * h);
     return normalize(vec3f(-dhdx, -dhdy, 1.0));
+}
+
+// Vertical depth of the snow cover at a point [m], 0 where there is none. The texture holds
+// vertical depth already; the uniform cover is a slope-normal thickness, like AvaFrame's, so a
+// vertical column holds thickness / cos(slope).
+fn cover_depth_at(world_xy: vec2f) -> f32 {
+    if settings.cover_mode == COVER_TEXTURE {
+        let dim = textureDimensions(entrainment_texture);
+        let texel = vec2u(clamp(world_to_uv(world_xy), vec2f(0.0), vec2f(0.9999)) * vec2f(dim));
+        return max(textureLoad(entrainment_texture, texel, 0).r, 0.0);
+    }
+    if settings.cover_mode == COVER_UNIFORM {
+        let up = terrain_normal(world_xy).z; // cos(slope)
+        if up < settings.cover_cos_max_slope {
+            return 0.0;
+        }
+        return settings.cover_thickness / max(up, 0.05);
+    }
+    return 0.0;
+}
+
+// The release lies here, so there is no cover: its snow is the release (com1DFA removes the
+// overlap too). The texture cover has these cells removed already (the loader); this is for the
+// uniform one. With seed_anywhere the release is the whole disc.
+fn under_release(world_xy: vec2f) -> bool {
+    let dim = textureDimensions(release_point_texture);
+    let texel = textureLoad(release_point_texture, vec2u(clamp(world_to_uv(world_xy), vec2f(0.0), vec2f(0.9999)) * vec2f(dim)), 0);
+    if settings.release_mode == RELEASE_GRID {
+        return texel.r > 0.0;
+    }
+    let centre = vec2f(settings.release_centre_x, settings.release_centre_y);
+    return distance(world_xy, centre) <= settings.release_radius && (settings.seed_anywhere > 0.5 || texel.a > 0.0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -267,6 +442,91 @@ fn grid_slot(node: vec3i) -> i32 {
     return layer * res.x * res.y + i32(column);
 }
 
+// ---------------------------------------------------------------------------------------
+// Active tiles
+// ---------------------------------------------------------------------------------------
+// The snow covers a small part of the domain - a release disc of 100 m in a 4 km box is
+// 0.2 % of the columns - yet a grid pass over every stored node costs as much as the whole
+// particle work. So the columns are grouped into TILE_SIZE x TILE_SIZE tiles; P2G flags the
+// tiles its stencil writes to, and the grid update runs one workgroup per tile and returns
+// at once for an unflagged one. The grid update is also the last reader of the P2G
+// accumulators, so it zeroes them there: nodes outside flagged tiles were never written and
+// are still zero, which is what makes a separate clear pass over the whole grid unnecessary.
+//
+// A tile's flag word has two bits. TILE_FLAGGED: P2G reached the tile in this substep.
+// TILE_WAS_ACTIVE: the grid update processed the tile in the previous substep. A tile that holds
+// only the second bit has lost its flow; the grid update still runs on it once, which writes zero
+// mass and velocity to its nodes. Without that, grid_velocity would keep the last flow's values
+// there for anything that reads the whole grid (the vector field), though G2P never does.
+const TILE_FLAGGED: u32 = 1u;
+const TILE_WAS_ACTIVE: u32 = 2u;
+const TILE_SIZE: i32 = 8; // the grid update's workgroup is TILE_SIZE x TILE_SIZE columns
+
+fn tiles_x() -> u32 { return (settings.grid_res.x + u32(TILE_SIZE) - 1u) / u32(TILE_SIZE); }
+
+fn tile_index(node_xy: vec2i) -> u32 {
+    let tile = clamp(node_xy, vec2i(0), vec2i(settings.grid_res.xy) - vec2i(1)) / TILE_SIZE;
+    return u32(tile.y) * tiles_x() + u32(tile.x);
+}
+
+fn mark_tile(node_xy: vec2i) {
+    let tile = tile_index(node_xy);
+    // Most particles find their tile flagged already; the load keeps them from all writing.
+    if (atomicLoad(&tile_flags[tile]) & TILE_FLAGGED) == 0u {
+        atomicOr(&tile_flags[tile], TILE_FLAGGED);
+    }
+}
+
+// Flags every tile the 3 x 3 column stencil starting at base_xy reaches. The stencil is
+// narrower than a tile, so its corners cover all (at most four) of them.
+fn mark_tiles(base_xy: vec2i) {
+    mark_tile(base_xy);
+    mark_tile(base_xy + vec2i(2, 0));
+    mark_tile(base_xy + vec2i(0, 2));
+    mark_tile(base_xy + vec2i(2, 2));
+}
+
+// ---------------------------------------------------------------------------------------
+// Particle indices sorted by sort tile (mpm_sort_*.wgsl, read by mpm_p2g.wgsl)
+// ---------------------------------------------------------------------------------------
+// P2G sums the particles of one SORT_TILE x SORT_TILE tile of columns in workgroup memory and
+// writes each grid node once per workgroup, instead of once per particle. For that its
+// workgroups need the particles of a tile next to each other: a counting sort of the particle
+// indices, once per chunk, by the tile of each particle's stencil base. The particle buffer
+// keeps its order - the renderer pairs particles[i] with previous[i] and seeds the detail
+// particles from i.
+//
+// The sort data shares binding 10 with the tile flags, which keeps the solver at WebGPU's
+// default of eight storage buffers per stage:
+//   [tile flags | bucket counts | bucket cursors | sorted particle indices]
+// One bucket per sort tile, plus a last one for inactive particles (mass 0: not seeded, or a
+// pool slot entrainment has not filled yet). They stay in the list, so a pool particle that
+// entrainment activates during the chunk is still transferred.
+const SORT_TILE: i32 = 4;
+
+fn flag_tile_count() -> u32 { return tiles_x() * ((settings.grid_res.y + u32(TILE_SIZE) - 1u) / u32(TILE_SIZE)); }
+fn sort_tiles_x() -> u32 { return (settings.grid_res.x + u32(SORT_TILE) - 1u) / u32(SORT_TILE); }
+fn sort_bucket_count() -> u32 { return sort_tiles_x() * ((settings.grid_res.y + u32(SORT_TILE) - 1u) / u32(SORT_TILE)) + 1u; }
+fn sort_counts_offset() -> u32 { return flag_tile_count(); }
+fn sort_cursors_offset() -> u32 { return sort_counts_offset() + sort_bucket_count(); }
+fn sorted_indices_offset() -> u32 { return sort_cursors_offset() + sort_bucket_count(); }
+
+// First column of the sort tile that holds a stencil base. Bases outside the grid (a particle
+// at the edge) clamp to the border tile; their outside nodes are skipped anyway.
+fn sort_tile_origin(base_xy: vec2i) -> vec2i {
+    return (clamp(base_xy, vec2i(0), vec2i(settings.grid_res.xy) - vec2i(1)) / SORT_TILE) * SORT_TILE;
+}
+
+fn sort_bucket(p: Particle) -> u32 {
+    if p.mass <= 0.0 {
+        return sort_bucket_count() - 1u;
+    }
+    let tile = sort_tile_origin(compute_kernel(to_grid_space(p.position)).base.xy) / SORT_TILE;
+    return u32(tile.y) * sort_tiles_x() + u32(tile.x);
+}
+
+fn sorted_index(position: u32) -> u32 { return atomicLoad(&tile_flags[sorted_indices_offset() + position]); }
+
 // Particle world position -> continuous grid coordinates (z absolute, in cells).
 fn to_grid_space(position: vec3f) -> vec3f {
     return vec3f((position.xy - settings.domain_origin) / settings.dx, position.z / settings.dx);
@@ -281,6 +541,10 @@ fn column_node_world(node_xy: vec2i, layer: i32) -> vec3f {
 // ---------------------------------------------------------------------------------------
 // Quadratic B-spline weights (MLS-MPM)
 // ---------------------------------------------------------------------------------------
+// The quadratic kernel of Hu 2018 (sec. 3.4, eq. 15, p. 7: M_p = dx^2 / 4 I) and of APIC
+// (Jiang 2015 sec. 5.3, eq. 9 and the text below it, p. 6: D_p = dx^2 / 4 I for quadratic,
+// dx^2 / 3 I for cubic). Hence the 4 / dx^2 in P2G and G2P. Stomakhin 2013 (sec. 4, p. 3) uses
+// the cubic B-spline instead.
 
 struct Kernel {
     base: vec3i,
@@ -319,6 +583,7 @@ fn identity3() -> mat3x3f { return mat3x3f(vec3f(1, 0, 0), vec3f(0, 1, 0), vec3f
 // Result A with A[i][j] = a_i * b_j.
 fn outer_product(a: vec3f, b: vec3f) -> mat3x3f { return mat3x3f(a * b.x, a * b.y, a * b.z); }
 
+// C_p = B_p D_p^-1, the APIC affine velocity matrix (Jiang 2015 sec. 5.3, eq. 8, p. 6).
 fn particle_c(p: Particle) -> mat3x3f {
     // c0/c1/c2 are the rows of C; mat3x3f takes columns.
     return mat3x3f(vec3f(p.c0.x, p.c1.x, p.c2.x), vec3f(p.c0.y, p.c1.y, p.c2.y), vec3f(p.c0.z, p.c1.z, p.c2.z));
@@ -340,11 +605,34 @@ fn store_f(p: ptr<function, Particle>, m: mat3x3f) {
     (*p).f2 = vec3f(m[0][2], m[1][2], m[2][2]);
 }
 
+fn particle_kirchhoff(p: Particle) -> mat3x3f {
+    return mat3x3f(vec3f(p.tau_xx, p.tau_xy, p.tau_xz), vec3f(p.tau_xy, p.tau_yy, p.tau_yz), vec3f(p.tau_xz, p.tau_yz, p.tau_zz));
+}
+
+// Stores the symmetric part; every model's tau is U diag(.) U^T and hence symmetric.
+fn store_kirchhoff(p: ptr<function, Particle>, m: mat3x3f) {
+    (*p).tau_xx = m[0][0];
+    (*p).tau_yy = m[1][1];
+    (*p).tau_zz = m[2][2];
+    (*p).tau_xy = 0.5 * (m[1][0] + m[0][1]);
+    (*p).tau_xz = 0.5 * (m[2][0] + m[0][2]);
+    (*p).tau_yz = 0.5 * (m[2][1] + m[1][2]);
+}
+
+fn diag3(v: vec3f) -> mat3x3f { return mat3x3f(vec3f(v.x, 0, 0), vec3f(0, v.y, 0), vec3f(0, 0, v.z)); }
+
+// U diag(d) U^T - a principal-frame stress rotated back to world space. For an isotropic model
+// P F^T = U diag(.) V^T V Sigma U^T, so V drops out (Klar 2016 sec. 6.3, eq. 26, p. 8 for Hencky;
+// Stomakhin 2013 sec. 5, eq. 1, p. 5 for fixed corotated).
+fn from_principal(u: mat3x3f, d: vec3f) -> mat3x3f { return u * diag3(d) * transpose(u); }
+
 // ---------------------------------------------------------------------------------------
 // 3x3 signed SVD
 // ---------------------------------------------------------------------------------------
 // F = U * diag(sigma) * V^T with det(U) = det(V) = 1; sigma.z carries the sign of det(F).
-// Obtained from a cyclic Jacobi eigendecomposition of the symmetric matrix F^T F.
+// Obtained from a cyclic Jacobi eigendecomposition of the symmetric matrix F^T F. No paper of
+// the project gives the algorithm (Jacobi: Golub and Van Loan, sec. 8.5); Stomakhin 2013 and
+// Klar 2016 only require a signed SVD.
 
 struct Svd {
     u: mat3x3f,

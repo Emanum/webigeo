@@ -23,20 +23,24 @@
 // Hencky (logarithmic) strain hyperelasticity with a pressure-dependent friction cone as
 // the yield surface and a closed-form projection back onto it. Cohesionless: it produces a
 // dry granular flow with an angle of repose, but no slab, no fracture, no plug - in the
-// language of Li et al. 2021 it covers the cold-dense regime only. Cheaper than Cam-Clay
-// (a projection onto a cone versus an implicit return onto an ellipse), which is why it is
-// the documented fallback if CCC proves too slow.
+// language of Li et al. 2021 it covers the cold-dense regime only. Not cheaper than Cam Clay
+// here: both returns are closed form and the cost is the shared SVD (M5 benchmark, 2026-09:
+// 0.66 vs 0.64 ms per substep), so it is an alternative material, not a performance fallback.
 //
 // Everything happens in the principal frame of F = U diag(sigma) V^T:
 //   eps   = log(sigma)                              Hencky strain
 //   tau   = 2 mu eps + lambda tr(eps)               Kirchhoff stress, principal values
 //   yield = |dev(tau)| + alpha tr(tau) <= 0         Drucker-Prager cone
 //
-// Per-particle plastic state: accumulated plastic strain magnitude (sum of the projection
-// distances). Not fed back into the model here - Klar's hardening of the friction angle is
-// left out - but it is a free diagnostic of which particles have yielded.
+// Per-particle plastic state: accumulated plastic strain magnitude, the same quantity as
+// Klar's hardening state q (section 7.3: delta q = 0, |eps|, delta gamma in Cases I-III).
+// Not fed back into the model - Klar's hardening of the friction angle (eq. 30, p. 9) is left out.
 // Parameters: settings.mu_0, lambda_0 (shared Lame parameters), dp_alpha (precomputed
-// from the friction angle, see MpmSolverNode::update_gpu_settings).
+// from the friction angle, see MpmSolverNode::update_gpu_settings; Klar sec. 7.3, eq. 31, p. 9).
+//
+// References (sections, equations and pages as in the PDFs; full list in mpm-mls-doc/refs.md):
+//   Klar 2016       G. Klar et al., "Drucker-Prager elastoplasticity for sand animation",
+//                   ACM TOG 35(4), Art. 103, 2016.
 
 fn dp_initial_state() -> f32 { return 0.0; }
 
@@ -44,19 +48,16 @@ fn dp_initial_state() -> f32 { return 0.0; }
 // inverted element; the clamp treats that as extreme compression instead of producing NaN.
 fn dp_hencky_strain(sigma: vec3f) -> vec3f { return log(clamp(sigma, vec3f(1e-3), vec3f(1e3))); }
 
-fn dp_diag(v: vec3f) -> mat3x3f { return mat3x3f(vec3f(v.x, 0, 0), vec3f(0, v.y, 0), vec3f(0, 0, v.z)); }
-
 // P F^T = U diag(tau) U^T for the Hencky model - the Kirchhoff stress rotated back out of
-// the principal frame.
-fn dp_stress(f_elastic: mat3x3f, plastic_state: f32) -> mat3x3f {
-    let svd = svd3(f_elastic);
-    let eps = dp_hencky_strain(svd.sigma);
+// the principal frame. Klar sec. 6.3, eq. 25-26 (p. 7-8): Sigma^-1 in dPsi/dF cancels against
+// the Sigma of F^T. Takes the principal Hencky strain, which the return mapping has.
+fn dp_kirchhoff(u: mat3x3f, eps: vec3f) -> mat3x3f {
     let trace = eps.x + eps.y + eps.z;
-    let tau = 2.0 * settings.mu_0 * eps + vec3f(settings.lambda_0 * trace);
-    return svd.u * dp_diag(tau) * transpose(svd.u);
+    return from_principal(u, 2.0 * settings.mu_0 * eps + vec3f(settings.lambda_0 * trace));
 }
 
-// Return mapping (Klar et al. 2016, section 5.3), on the Hencky strain in the principal frame.
+// Return mapping (Klar 2016 sec. 7.1, eq. 27-28, p. 8), on the Hencky strain in the
+// principal frame. Klar's flow rule is itself non-associative (it preserves volume in Case III).
 fn dp_plasticity(f_trial: mat3x3f, plastic_state: f32) -> PlasticReturn {
     let svd = svd3(f_trial);
     let eps = dp_hencky_strain(svd.sigma);
@@ -88,7 +89,9 @@ fn dp_plasticity(f_trial: mat3x3f, plastic_state: f32) -> PlasticReturn {
     }
 
     var result: PlasticReturn;
-    result.f_elastic = svd.u * dp_diag(exp(new_eps)) * transpose(svd.v);
-    result.plastic_state = plastic_state + delta_gamma;
+    result.yielded = delta_gamma > 0.0;
+    result.f_elastic = svd.u * diag3(exp(new_eps)) * transpose(svd.v);
+    result.plastic_state = plastic_state + delta_gamma; // Klar sec. 7.3, eq. 29 (p. 9)
+    result.kirchhoff = dp_kirchhoff(svd.u, new_eps);
     return result;
 }

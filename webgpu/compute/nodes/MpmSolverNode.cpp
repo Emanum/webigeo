@@ -17,18 +17,23 @@
  *****************************************************************************/
 
 #include "MpmSolverNode.h"
+#include "AvaFrameReleaseNode.h"
+
+#include "AvaFrameSandboxNode.h"
 
 #include <QDebug>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <nucleus/srs.h>
+#include <unordered_map>
 
 namespace webgpu_compute::nodes {
 
 glm::uvec3 MpmSolverNode::PARTICLE_WORKGROUP_SIZE = { 256, 1, 1 };
-glm::uvec3 MpmSolverNode::GRID_WORKGROUP_SIZE = { 4, 4, 4 };
+glm::uvec3 MpmSolverNode::GRID_WORKGROUP_SIZE = { 8, 8, 1 };
 glm::uvec3 MpmSolverNode::RASTER_WORKGROUP_SIZE = { 16, 16, 1 };
 
 const uint32_t MpmSolverNode::MAX_PARTICLES = 1u << 21;
@@ -41,11 +46,36 @@ namespace {
     constexpr uint32_t PARTICLE_STRIDE_U32 = 32u; // 128 bytes
     /* Size of struct GridNode in mpm_common.wgsl, in units of uint32. */
     constexpr uint32_t GRID_NODE_STRIDE_U32 = 5u; // 20 bytes
+    /* grid_velocity in mpm_common.wgsl: one vec4f per node. */
+    constexpr uint32_t GRID_VELOCITY_STRIDE_U32 = 4u; // 16 bytes
+    /* Size of struct ColumnStats in mpm_common.wgsl, in units of uint32: peak depth and speed
+     * (f32), two per-substep accumulators, then the column's snow cover and its eroded rest. */
+    constexpr uint32_t COLUMN_STATS_STRIDE_U32 = 6u; // 24 bytes (the last two: entrainment cover)
+    // Columns per sort tile edge, SORT_TILE in mpm_common.wgsl: P2G sums one sort tile's particles in
+    // workgroup memory, and the particle indices are sorted by it once per chunk.
+    constexpr uint32_t SORT_TILE = 4u;
     /* Size of struct SimState in mpm_common.wgsl, in units of uint32. */
-    constexpr uint32_t SIM_STATE_SIZE_U32 = 14u; // 56 bytes
+    constexpr uint32_t SIM_STATE_SIZE_U32 = 21u; // 84 bytes
+    /* Slots of struct SimState. */
+    constexpr size_t STATE_SEED_FIRST_HITS = 5;
+    constexpr size_t STATE_SUM_X = 6;
+    constexpr size_t STATE_SUM_Y = 8;
+    constexpr size_t STATE_SUM_Z = 10;
+    constexpr size_t STATE_SUM_SPEED_SQ = 12;
+    constexpr size_t STATE_SUM_PATH = 14;
+    constexpr size_t STATE_CEILING_CONTACTS = 16;
+    constexpr size_t STATE_WALL_CONTACTS = 17;
+    constexpr size_t STATE_COVER_VOLUME = 18;
+    constexpr size_t STATE_ENTRAINED_PARTICLES = 19;
+    constexpr size_t STATE_POOL_EXHAUSTED = 20;
+    constexpr double COVER_VOLUME_SCALE = 100.0; // mpm_common.wgsl
     /* Mirrors the constants in mpm_common.wgsl. */
     constexpr double SUM_POSITION_SCALE = 1.0e4;
     constexpr double SUM_SPEED_SQ_SCALE = 1.0e5;
+    constexpr double SUM_PATH_SCALE = 1.0e5;
+
+    /* Fraction of the time a P wave needs to cross one cell that a substep may take. */
+    constexpr float CFL_NUMBER = 0.1f;
 
     /* Reassembles a lo/hi u32 pair written by the shader's carry-detecting atomic adds. */
     uint64_t wide(const std::vector<uint32_t>& data, size_t lo_slot) { return (uint64_t(data[lo_slot + 1]) << 32) | uint64_t(data[lo_slot]); }
@@ -84,6 +114,10 @@ MpmSolverNode::MpmSolverNode(webgpu::Context& ctx, const MpmSolverSettings& sett
               InputSocket(*this, "region aabb", data_type<const radix::geometry::Aabb<2, double>*>()),
               InputSocket(*this, "height texture", data_type<const webgpu::raii::TextureWithSampler*>()),
               InputSocket(*this, "release point texture", data_type<const webgpu::raii::TextureWithSampler*>()),
+              // Optional. Connected = sandbox mode, see the class comment.
+              InputSocket(*this, "sandbox", data_type<const SandboxTerrain*>()),
+              // Optional, map only: release areas given per cell (AvaFrameReleaseNode) instead of the disc.
+              InputSocket(*this, "release area", data_type<const ReleaseArea*>()),
           },
           {
               OutputSocket(*this, "texture", data_type<const webgpu::raii::TextureWithSampler*>(), [this]() { return m_output_texture.get(); }),
@@ -91,26 +125,52 @@ MpmSolverNode::MpmSolverNode(webgpu::Context& ctx, const MpmSolverSettings& sett
               OutputSocket(*this, "density buffer", data_type<webgpu::raii::RawBuffer<uint32_t>*>(), [this]() { return m_density_buffer.get(); }),
               OutputSocket(*this, "raster dimensions", data_type<glm::uvec2>(), [this]() { return m_output_dimensions; }),
               OutputSocket(*this, "particle buffer", data_type<webgpu::raii::RawBuffer<uint32_t>*>(), [this]() { return m_particle_buffer.get(); }),
+              OutputSocket(*this, "particle view", data_type<const MpmParticleView*>(), [this]() { return &m_particle_view; }),
           })
     , m_ctx(&ctx)
     , m_settings { settings }
     , m_settings_uniform(ctx.device(), WGPUBufferUsage(WGPUBufferUsage_CopyDst | WGPUBufferUsage_Uniform))
+    , m_alive(std::make_shared<MpmSolverNode*>(this))
     , m_domain_aabb { glm::dvec2(0.0), glm::dvec2(0.0) }
 {
     // Fixed size, so allocated exactly once: an asynchronous readback may be in flight while
-    // ensure_resources() reallocates everything else, and a readback into a freed buffer
-    // would be a use-after-free.
+    // ensure_resources() reallocates everything else.
     m_state_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(ctx.device(),
         WGPUBufferUsage(WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc), SIM_STATE_SIZE_U32, "mpm state buffer");
+    // Persistent staging buffer for the per-run diagnostics. The last chunk of a run copies
+    // the state into it inside its own command buffer; RawBuffer::read_back_async() would
+    // instead allocate a staging buffer and submit a separate copy on every run.
+    m_state_readback = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
+        ctx.device(), WGPUBufferUsage(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst), SIM_STATE_SIZE_U32, "mpm state readback");
+
+    // GPU time per substep, for the adaptive pacing. Timestamp writes on our own compute
+    // pass are core WebGPU (behind the timestamp-query feature), so this works on the web too.
+    if (wgpuDeviceHasFeature(ctx.device(), WGPUFeatureName_TimestampQuery)) {
+        WGPUQuerySetDescriptor query_desc {};
+        query_desc.label = WGPUStringView { .data = "mpm solver timestamps", .length = WGPU_STRLEN };
+        query_desc.type = WGPUQueryType_Timestamp;
+        query_desc.count = 2 * TIMESTAMP_SLOTS;
+        m_timestamp_queries = wgpuDeviceCreateQuerySet(ctx.device(), &query_desc);
+        m_timestamp_resolve = std::make_unique<webgpu::raii::RawBuffer<uint64_t>>(ctx.device(),
+            WGPUBufferUsage(WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc),
+            TIMESTAMP_SLOTS * TIMESTAMP_SLOT_STRIDE_BYTES / sizeof(uint64_t), "mpm timestamp resolve");
+        for (auto& buffer : m_timestamp_readback)
+            buffer = std::make_unique<webgpu::raii::RawBuffer<uint64_t>>(
+                ctx.device(), WGPUBufferUsage(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst), 2, "mpm timestamp readback");
+    }
 
     auto& reg = ctx.resource_registry();
 
     reg.register_shader("mpm_prepare", "webgpu_compute::mpm_prepare");
     reg.register_shader("mpm_seed", "webgpu_compute::mpm_seed");
-    reg.register_shader("mpm_clear_grid", "webgpu_compute::mpm_clear_grid");
+    reg.register_shader("mpm_sort_count", "webgpu_compute::mpm_sort_count");
+    reg.register_shader("mpm_sort_scan", "webgpu_compute::mpm_sort_scan");
+    reg.register_shader("mpm_sort_scatter", "webgpu_compute::mpm_sort_scatter");
     reg.register_shader("mpm_p2g", "webgpu_compute::mpm_p2g");
     reg.register_shader("mpm_grid_update", "webgpu_compute::mpm_grid_update");
     reg.register_shader("mpm_g2p", "webgpu_compute::mpm_g2p");
+    reg.register_shader("mpm_column_stats", "webgpu_compute::mpm_column_stats");
+    reg.register_shader("mpm_refresh_stress", "webgpu_compute::mpm_refresh_stress");
     reg.register_shader("mpm_splat", "webgpu_compute::mpm_splat");
     reg.register_shader("mpm_rasterize", "webgpu_compute::mpm_rasterize");
 
@@ -128,102 +188,285 @@ MpmSolverNode::MpmSolverNode(webgpu::Context& ctx, const MpmSolverSettings& sett
             std::vector<WGPUBindGroupLayoutEntry> {
                 buffer_entry(0, WGPUBufferBindingType_Uniform),
                 texture_entry(1, WGPUTextureSampleType_UnfilterableFloat), // height texture is R32Float
-                texture_entry(2, WGPUTextureSampleType_Float), // release points are RGBA8Unorm
+                // Release points (RGBA8Unorm) on the map, release depth (R32Float) in the sandbox.
+                // Only read with textureLoad, so unfilterable-float accepts both.
+                texture_entry(2, WGPUTextureSampleType_UnfilterableFloat),
                 buffer_entry(3, WGPUBufferBindingType_Storage), // particles
                 buffer_entry(4, WGPUBufferBindingType_Storage), // background grid
                 buffer_entry(5, WGPUBufferBindingType_Storage), // simulation state
                 buffer_entry(6, WGPUBufferBindingType_Storage), // density raster
                 e7, // output texture
                 buffer_entry(8, WGPUBufferBindingType_Storage), // column floors of the terrain-following grid
+                buffer_entry(9, WGPUBufferBindingType_Storage), // grid node velocities
+                buffer_entry(10, WGPUBufferBindingType_Storage), // active tile flags
+                buffer_entry(11, WGPUBufferBindingType_Storage), // column stats: peak depth and speed
+                texture_entry(12, WGPUTextureSampleType_UnfilterableFloat), // snow cover depth (R32Float), entrainment
             },
             "mpm solver bind group layout");
     });
 
-    m_pipeline_registration = reg.register_pipeline([this](WGPUDevice device, const webgpu::RenderResourceRegistry& reg) {
-        const std::vector<const webgpu::raii::BindGroupLayout*> layouts { &reg.bind_group_layout("mpm_solver") };
-        const auto make = [&](const std::string& shader_name) {
-            return std::make_unique<webgpu::raii::CombinedComputePipeline>(device, reg.shader(shader_name), layouts);
-        };
-        m_prepare_pipeline = make("mpm_prepare");
-        m_seed_pipeline = make("mpm_seed");
-        m_clear_grid_pipeline = make("mpm_clear_grid");
-        m_p2g_pipeline = make("mpm_p2g");
-        m_grid_update_pipeline = make("mpm_grid_update");
-        m_g2p_pipeline = make("mpm_g2p");
-        m_splat_pipeline = make("mpm_splat");
-        m_rasterize_pipeline = make("mpm_rasterize");
-    });
+    // Bound in place of a cover texture when there is none: 1x1, depth 0.
+    {
+        WGPUTextureDescriptor texture_desc {};
+        texture_desc.label = WGPUStringView { .data = "mpm no snow cover", .length = WGPU_STRLEN };
+        texture_desc.dimension = WGPUTextureDimension_2D;
+        texture_desc.size = { 1, 1, 1 };
+        texture_desc.mipLevelCount = 1;
+        texture_desc.sampleCount = 1;
+        texture_desc.format = WGPUTextureFormat_R32Float;
+        texture_desc.usage = WGPUTextureUsage(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
+        WGPUSamplerDescriptor sampler_desc {};
+        sampler_desc.addressModeU = WGPUAddressMode_ClampToEdge;
+        sampler_desc.addressModeV = WGPUAddressMode_ClampToEdge;
+        sampler_desc.addressModeW = WGPUAddressMode_ClampToEdge;
+        sampler_desc.magFilter = WGPUFilterMode_Nearest;
+        sampler_desc.minFilter = WGPUFilterMode_Nearest;
+        sampler_desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+        sampler_desc.lodMaxClamp = 1.0f;
+        sampler_desc.maxAnisotropy = 1;
+        m_no_cover_texture = std::make_unique<webgpu::raii::TextureWithSampler>(ctx.device(), texture_desc, sampler_desc);
+        m_no_cover_texture->texture().write(ctx.queue(), nucleus::Raster<float>(glm::uvec2(1), 0.0f));
+    }
+
+    // The handle unregisters the factory when the node is destroyed, so a shader reload (F5)
+    // never calls into a solver of a replaced graph.
+    m_pipeline_registration = reg.register_pipeline(
+        [this](WGPUDevice device, const webgpu::RenderResourceRegistry& registry) { create_pipelines(device, registry); });
+}
+
+MpmSolverNode::~MpmSolverNode()
+{
+    *m_alive = nullptr; // in-flight callbacks now find the node gone
+    if (m_timestamp_queries != nullptr)
+        wgpuQuerySetRelease(m_timestamp_queries);
+}
+
+void MpmSolverNode::create_pipelines(WGPUDevice device, const webgpu::RenderResourceRegistry& reg)
+{
+    const std::vector<const webgpu::raii::BindGroupLayout*> layouts { &reg.bind_group_layout("mpm_solver") };
+    const auto make = [&](const std::string& shader_name) {
+        return std::make_unique<webgpu::raii::CombinedComputePipeline>(device, reg.shader(shader_name), layouts);
+    };
+    m_prepare_pipeline = make("mpm_prepare");
+    m_seed_pipeline = make("mpm_seed");
+    m_sort_count_pipeline = make("mpm_sort_count");
+    m_sort_scan_pipeline = make("mpm_sort_scan");
+    m_sort_scatter_pipeline = make("mpm_sort_scatter");
+    m_p2g_pipeline = make("mpm_p2g");
+    m_grid_update_pipeline = make("mpm_grid_update");
+    m_g2p_pipeline = make("mpm_g2p");
+    m_column_stats_pipeline = make("mpm_column_stats");
+    m_refresh_stress_pipeline = make("mpm_refresh_stress");
+    m_splat_pipeline = make("mpm_splat");
+    m_rasterize_pipeline = make("mpm_rasterize");
 }
 
 bool MpmSolverNode::ensure_resources()
 {
-    const uint32_t num_particles = std::clamp(m_settings.num_particles, 1u, MAX_PARTICLES);
-    const glm::uvec3 grid_res(std::clamp(m_settings.grid_resolution_xy, 8u, MAX_GRID_RESOLUTION_XY),
+    // Every buffer is bound whole, so none may exceed the device's storage binding limit -
+    // at the top of the UI ranges the grid (512^2 x 64 x 20 B = 320 MiB) would. Shrink the
+    // offending dimension instead of failing validation (and losing the device on the web).
+    WGPULimits limits {};
+    wgpuDeviceGetLimits(m_ctx->device(), &limits);
+    const uint64_t max_binding = std::max<uint64_t>(limits.maxStorageBufferBindingSize, 1u << 20);
+
+    // The release particles, then the slots of the snow cover (plan_cover() keeps both together
+    // within the limits; this only guards the release alone).
+    uint32_t num_particles = std::clamp(m_settings.num_particles, 1u, MAX_PARTICLES);
+    num_particles = uint32_t(std::min<uint64_t>(num_particles, max_binding / (PARTICLE_STRIDE_U32 * 4u)));
+    const uint32_t release_particles = num_particles;
+    num_particles += m_cover.slot_count;
+    glm::uvec3 grid_res(std::clamp(m_settings.grid_resolution_xy, 8u, MAX_GRID_RESOLUTION_XY),
         std::clamp(m_settings.grid_resolution_xy, 8u, MAX_GRID_RESOLUTION_XY),
         std::clamp(m_settings.grid_layers, 8u, MAX_GRID_LAYERS));
+    const uint64_t max_nodes = max_binding / (GRID_NODE_STRIDE_U32 * 4u);
+    while (grid_res.z > 8u && uint64_t(grid_res.x) * grid_res.y * grid_res.z > max_nodes)
+        grid_res.z--;
+    while (uint64_t(grid_res.x) * grid_res.y * grid_res.z > max_nodes)
+        grid_res.x = grid_res.y = grid_res.x - 8u;
+    const bool limited = release_particles != std::clamp(m_settings.num_particles, 1u, MAX_PARTICLES)
+        || grid_res.z != std::clamp(m_settings.grid_layers, 8u, MAX_GRID_LAYERS)
+        || grid_res.x != std::clamp(m_settings.grid_resolution_xy, 8u, MAX_GRID_RESOLUTION_XY);
     const uint32_t raster_resolution = std::clamp(m_settings.raster_resolution, 64u, 4096u);
 
-    if (m_particle_buffer && num_particles == m_allocated_particles && grid_res == m_allocated_grid_res
+    if (m_particle_buffer && num_particles == m_allocated_particles && release_particles == m_release_particles && grid_res == m_allocated_grid_res
         && raster_resolution == m_allocated_raster_resolution) {
         return false;
+    }
+    if (limited) {
+        qWarning() << "MpmSolverNode: reduced to" << num_particles << "particles and a" << grid_res.x << "x" << grid_res.y << "x" << grid_res.z
+                   << "grid to stay within the device's storage buffer binding limit of" << max_binding / (1024 * 1024) << "MiB";
     }
 
     const auto storage_usage = WGPUBufferUsage(WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc);
 
     m_particle_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
         m_ctx->device(), storage_usage, size_t(num_particles) * PARTICLE_STRIDE_U32, "mpm particle buffer");
+    m_previous_particles = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
+        m_ctx->device(), storage_usage, size_t(num_particles) * PARTICLE_STRIDE_U32, "mpm previous particle buffer");
     m_grid_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
         m_ctx->device(), storage_usage, size_t(grid_res.x) * grid_res.y * grid_res.z * GRID_NODE_STRIDE_U32, "mpm grid buffer");
     m_column_floor_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
         m_ctx->device(), storage_usage, size_t(grid_res.x) * grid_res.y, "mpm column floor buffer");
+    m_grid_velocity_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
+        m_ctx->device(), storage_usage, size_t(grid_res.x) * grid_res.y * grid_res.z * GRID_VELOCITY_STRIDE_U32, "mpm grid velocity buffer");
+    const glm::uvec2 tiles(div_ceil(grid_res.x, GRID_WORKGROUP_SIZE.x), div_ceil(grid_res.y, GRID_WORKGROUP_SIZE.y));
+    // The tile flags, then the particle sort data (mpm_common.wgsl, "Particle indices sorted by
+    // sort tile"): a count and a cursor per sort tile plus one bucket for inactive particles, and
+    // the sorted particle indices. Sharing the binding keeps the solver at eight storage buffers.
+    const size_t sort_buckets = size_t(div_ceil(grid_res.x, SORT_TILE)) * div_ceil(grid_res.y, SORT_TILE) + 1u;
+    m_tile_flag_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
+        m_ctx->device(), storage_usage, size_t(tiles.x) * tiles.y + 2u * sort_buckets + num_particles, "mpm tile flags and particle sort");
+    m_column_peak_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
+        m_ctx->device(), storage_usage, size_t(grid_res.x) * grid_res.y * COLUMN_STATS_STRIDE_U32, "mpm column stats");
     m_density_buffer = std::make_unique<webgpu::raii::RawBuffer<uint32_t>>(
         m_ctx->device(), storage_usage, size_t(raster_resolution) * raster_resolution, "mpm density raster");
     m_output_texture = create_output_texture(m_ctx->device(), raster_resolution, raster_resolution);
 
     m_allocated_particles = num_particles;
+    m_release_particles = release_particles;
+    m_particle_view.particles = m_particle_buffer.get();
+    m_particle_view.previous_particles = nullptr;
+    m_particle_view.particle_count = num_particles;
+    m_particle_view.column_stats = m_column_peak_buffer.get();
     m_allocated_grid_res = grid_res;
     m_allocated_raster_resolution = raster_resolution;
     m_output_dimensions = glm::uvec2(raster_resolution);
+    m_resource_generation++;
+
+    const auto bytes = [](const auto& buffer) { return uint64_t(buffer->size_in_byte()); };
+    m_perf.gpu_bytes = bytes(m_particle_buffer) + bytes(m_previous_particles) + bytes(m_grid_buffer) + bytes(m_grid_velocity_buffer) + bytes(m_tile_flag_buffer)
+        + bytes(m_column_peak_buffer) + bytes(m_column_floor_buffer) + bytes(m_density_buffer) + bytes(m_state_buffer) + bytes(m_state_readback)
+        + uint64_t(raster_resolution) * raster_resolution * 4u /* RGBA8 output texture */;
 
     // Fresh buffers hold garbage - the simulation has to be re-seeded.
     m_settings.reset_on_next_run = true;
     return true;
 }
 
-void MpmSolverNode::create_bind_group(const webgpu::raii::TextureWithSampler& height_texture, const webgpu::raii::TextureWithSampler& release_point_texture)
+void MpmSolverNode::ensure_bind_group(const webgpu::raii::TextureWithSampler& height_texture, const webgpu::raii::TextureWithSampler& release_texture)
 {
+    const webgpu::raii::TextureWithSampler& cover_texture = m_cover.texture != nullptr ? *m_cover.texture : *m_no_cover_texture;
+    if (m_bind_group && m_bind_group_generation == m_resource_generation && m_bind_group_run_id == get_run_id()
+        && m_bind_group_height == height_texture.texture().handle() && m_bind_group_release == release_texture.texture().handle()
+        && m_bind_group_cover == cover_texture.texture().handle())
+        return;
+    m_bind_group_generation = m_resource_generation;
+    m_bind_group_run_id = get_run_id();
+    m_bind_group_height = height_texture.texture().handle();
+    m_bind_group_release = release_texture.texture().handle();
+    m_bind_group_cover = cover_texture.texture().handle();
+
     m_bind_group = std::make_unique<webgpu::raii::BindGroup>(m_ctx->device(),
         m_ctx->resource_registry().bind_group_layout("mpm_solver"),
         std::vector<WGPUBindGroupEntry> {
             m_settings_uniform.raw_buffer().create_bind_group_entry(0),
             height_texture.texture_view().create_bind_group_entry(1),
-            release_point_texture.texture_view().create_bind_group_entry(2),
+            release_texture.texture_view().create_bind_group_entry(2),
             m_particle_buffer->create_bind_group_entry(3),
             m_grid_buffer->create_bind_group_entry(4),
             m_state_buffer->create_bind_group_entry(5),
             m_density_buffer->create_bind_group_entry(6),
             m_output_texture->texture_view().create_bind_group_entry(7),
             m_column_floor_buffer->create_bind_group_entry(8),
+            m_grid_velocity_buffer->create_bind_group_entry(9),
+            m_tile_flag_buffer->create_bind_group_entry(10),
+            m_column_peak_buffer->create_bind_group_entry(11),
+            cover_texture.texture_view().create_bind_group_entry(12),
         },
         "mpm solver bind group");
 }
 
-void MpmSolverNode::update_gpu_settings(const radix::geometry::Aabb<2, double>& region_aabb, const webgpu::raii::TextureWithSampler& height_texture)
+float MpmSolverNode::max_stable_dt(const MpmSolverSettings& settings, float dx)
 {
-    const glm::fvec2 region_size = glm::fvec2(region_aabb.size());
+    // P-wave speed sqrt((lambda + 2 mu) / rho), the fastest elastic wave - 16 % above
+    // sqrt(E / rho) at nu = 0.3. Uses the base stiffness: Stomakhin's compaction hardening
+    // can stiffen the material further (up to 20x, see its clamp), which this ignores.
+    const float nu = std::clamp(settings.poissons_ratio, 0.0f, 0.45f);
+    const float e = std::max(settings.youngs_modulus, 1.0f);
+    const float p_modulus = e * (1.0f - nu) / ((1.0f + nu) * (1.0f - 2.0f * nu)); // lambda + 2 mu
+    const float wave_speed = std::sqrt(p_modulus / std::max(settings.snow_density, 1.0f));
+    return CFL_NUMBER * dx / std::max(wave_speed, 1e-3f);
+}
+
+MpmSolverNode::DomainPlacement MpmSolverNode::place_domain(const radix::geometry::Aabb<2, double>& region_aabb, const SandboxTerrain* sandbox) const
+{
+    // The solver works in metres. World units are Web Mercator, which stretches distances by
+    // 1/cos(latitude) - 1.47 at 47 degrees N - while heights are real metres, so taking world
+    // units as metres simulates every slope too flat (a 37 degree slope at about 27). Region
+    // offsets are scaled to metres here and the domain box scaled back for the map; across a
+    // few kilometres the scale varies by well under 0.1 %, so one factor for the region is enough.
+    // The sandbox region is a DEM in metres already.
+    DomainPlacement placement;
+    if (sandbox == nullptr) {
+        const glm::dvec2 region_centre = nucleus::srs::world_to_lat_long((region_aabb.min + region_aabb.max) * 0.5);
+        placement.metres_per_world_unit = std::cos(glm::radians(region_centre.x));
+    }
+    const double to_metres = placement.metres_per_world_unit;
+    const glm::fvec2 region_size = glm::fvec2(region_aabb.size() * to_metres);
     // The domain cannot usefully exceed the terrain we actually have: outside the region the
     // height texture clamps to its edge texel, which would be a flat extrusion, not terrain.
-    const float region_limit = std::max(std::min(region_size.x, region_size.y), 1.0f);
+    // The sandbox allows the longer side: AvaFrame's DEMs are oblong and the avalanche runs
+    // along them, and its NODATA rim is filled the same way anyway (AvaFrameSandboxNode).
+    const float region_limit = sandbox != nullptr ? std::max(region_size.x, region_size.y) : std::max(std::min(region_size.x, region_size.y), 1.0f);
     const float domain_size = std::clamp(m_settings.domain_size_xy, 1.0f, region_limit);
-    const float dx = domain_size / float(m_allocated_grid_res.x);
 
     // Place the domain inside the region and keep it fully covered by the terrain data.
     // Geographic anchors are converted here, where the region bounds are known, so tile
     // snapping cannot move the scenario relative to the ground.
-    const glm::dvec2 domain_centre_world = nucleus::srs::lat_long_to_world(m_settings.domain_center);
-    const glm::fvec2 requested_origin = glm::fvec2(domain_centre_world - region_aabb.min) - glm::fvec2(domain_size * 0.5f);
+    // The sandbox centres the domain on the dataset's avalanche (release and reference footprint).
+    const glm::fvec2 requested_centre = sandbox != nullptr
+        ? glm::fvec2(sandbox->suggested_domain_centre)
+        : glm::fvec2((nucleus::srs::lat_long_to_world(m_settings.domain_center) - region_aabb.min) * to_metres);
+    const glm::fvec2 requested_origin = requested_centre - glm::fvec2(domain_size * 0.5f);
     const glm::fvec2 max_origin = glm::max(region_size - glm::fvec2(domain_size), glm::fvec2(0.0f));
-    const glm::fvec2 domain_origin = glm::clamp(requested_origin, glm::fvec2(0.0f), max_origin);
+    placement.region_size = region_size;
+    placement.origin = glm::clamp(requested_origin, glm::fvec2(0.0f), max_origin);
+    placement.size = domain_size;
+    return placement;
+}
+
+void MpmSolverNode::plan_cover(const SandboxTerrain* sandbox, const ReleaseArea* release_area)
+{
+    CoverPlan plan;
+    if (m_settings.entrainment_mode != ENTRAINMENT_OFF) {
+        // AvaFrame's entrainment areas where they exist (sandbox; AvaFrame scenarios on the map),
+        // else on the map one thickness on every slope up to the limit.
+        if (sandbox != nullptr && sandbox->entrainment_texture != nullptr) {
+            plan.mode = 1u;
+            plan.texture = sandbox->entrainment_texture;
+        } else if (sandbox == nullptr && release_area != nullptr && release_area->entrainment_texture != nullptr) {
+            plan.mode = 1u;
+            plan.texture = release_area->entrainment_texture;
+        } else if (sandbox == nullptr && m_settings.cover_thickness > 0.0f) {
+            plan.mode = 2u;
+        }
+        // The pool, within the device's limit on the particle buffer.
+        if (plan.mode != 0u) {
+            WGPULimits limits {};
+            wgpuDeviceGetLimits(m_ctx->device(), &limits);
+            const uint64_t max_binding = std::max<uint64_t>(limits.maxStorageBufferBindingSize, 1u << 20);
+            const uint64_t max_total = std::min<uint64_t>(MAX_PARTICLES, max_binding / (PARTICLE_STRIDE_U32 * 4u));
+            const uint64_t release_particles = std::clamp(m_settings.num_particles, 1u, MAX_PARTICLES);
+            const uint64_t wanted = uint64_t(std::max(m_settings.pool_size, 0.0f) * double(release_particles));
+            plan.slot_count = uint32_t(std::min<uint64_t>(wanted, max_total > release_particles ? max_total - release_particles : 0u));
+            if (plan.slot_count == 0u)
+                plan = {};
+        }
+    }
+    m_cover = plan;
+}
+
+void MpmSolverNode::update_gpu_settings(const radix::geometry::Aabb<2, double>& region_aabb, const webgpu::raii::TextureWithSampler& height_texture,
+    const SandboxTerrain* sandbox, const ReleaseArea* release_area)
+{
+    const DomainPlacement placement = place_domain(region_aabb, sandbox);
+    m_metres_per_world_unit = placement.metres_per_world_unit;
+    const double to_metres = placement.metres_per_world_unit;
+    const glm::fvec2 region_size = placement.region_size;
+    const float domain_size = placement.size;
+    const glm::fvec2 domain_origin = placement.origin;
+    const float dx = domain_size / float(m_allocated_grid_res.x);
 
     auto& data = m_settings_uniform.data;
     data.grid_res = m_allocated_grid_res;
@@ -233,7 +476,6 @@ void MpmSolverNode::update_gpu_settings(const radix::geometry::Aabb<2, double>& 
     data.dx = dx;
     data.region_size = region_size;
     data.height_texture_dim = glm::uvec2(height_texture.texture().width(), height_texture.texture().height());
-    data.dt = m_settings.dt;
     data.gravity = m_settings.gravity;
 
     // Mass is normalised to 1 per particle. Scaling mass and volume by the same factor
@@ -246,6 +488,17 @@ void MpmSolverNode::update_gpu_settings(const radix::geometry::Aabb<2, double>& 
     const float e = std::max(m_settings.youngs_modulus, 1.0f);
     data.mu_0 = e / (2.0f * (1.0f + nu));
     data.lambda_0 = e * nu / ((1.0f + nu) * (1.0f - 2.0f * nu));
+
+    // The time step has to resolve the fastest elastic wave across a cell. Checked here, on
+    // every run, so a hand edit of the stiffness, density, grid or dt cannot slip past it the
+    // way it could when only applying a preset pulled dt down.
+    const float limit = max_stable_dt(m_settings, dx);
+    if (m_settings.dt > limit) {
+        qWarning().nospace() << "MpmSolverNode: dt " << m_settings.dt << " s exceeds the CFL bound " << limit << " s for dx " << dx
+                             << " m; reduced to " << 0.8f * limit << " s";
+        m_settings.dt = 0.8f * limit;
+    }
+    data.dt = m_settings.dt;
     data.hardening = m_settings.hardening;
     data.critical_compression = m_settings.critical_compression;
     data.critical_stretch = m_settings.critical_stretch;
@@ -262,33 +515,77 @@ void MpmSolverNode::update_gpu_settings(const radix::geometry::Aabb<2, double>& 
     const float radius_texels = std::clamp(std::max(m_settings.splat_radius, 0.0f) / metres_per_texel, 0.5f, 8.0f);
     data.splat_radius_texels = radius_texels;
 
-    // Release zone, in region-relative metres. Clamped into the domain (with a margin for
-    // its own radius) so a slightly misplaced scenario still seeds instead of silently
-    // producing nothing.
-    const glm::dvec2 release_world = nucleus::srs::lat_long_to_world(m_settings.release_center);
-    data.release_radius = std::clamp(m_settings.release_radius, 1.0f, domain_size * 0.4f);
-    const float margin = data.release_radius + 2.0f * dx;
-    const glm::fvec2 release_centre = glm::clamp(glm::fvec2(release_world - region_aabb.min),
-        domain_origin + glm::fvec2(margin),
-        domain_origin + glm::fvec2(domain_size - margin));
-    data.release_centre_x = release_centre.x;
-    data.release_centre_y = release_centre.y;
+    float release_area_texels = 0.0f;
+    if (sandbox != nullptr) {
+        // Release cells with their depth: the seed samples the bounds of the release cells and
+        // keeps a sample with probability depth / max depth. The cells are where AvaFrame put
+        // them; no clamping into the domain - cells outside it are simply not seeded.
+        const glm::dvec2 centre = (sandbox->release_min + sandbox->release_max) * 0.5;
+        const glm::dvec2 half = (sandbox->release_max - sandbox->release_min) * 0.5;
+        data.release_mode = 1u;
+        data.release_centre_x = float(centre.x);
+        data.release_centre_y = float(centre.y);
+        data.release_radius = float(half.x);
+        data.release_half_y = float(half.y);
+        data.release_volume = float(sandbox->release_volume);
+        data.release_max_depth = sandbox->release_max_depth;
+        release_area_texels = float(sandbox->release_area) / (metres_per_texel * metres_per_texel);
+    } else if (release_area != nullptr) {
+        // The map with release areas given per cell (AvaFrame's, resampled onto the region by
+        // AvaFrameReleaseNode): the sandbox's release grid mode, in region metres. Cells
+        // outside the domain are not seeded.
+        const glm::dvec2 centre = (release_area->min + release_area->max) * 0.5;
+        const glm::dvec2 half = (release_area->max - release_area->min) * 0.5;
+        data.release_mode = 1u;
+        data.release_centre_x = float(centre.x);
+        data.release_centre_y = float(centre.y);
+        data.release_radius = float(half.x);
+        data.release_half_y = float(half.y);
+        data.release_volume = float(release_area->volume);
+        data.release_max_depth = release_area->max_depth;
+        release_area_texels = float(release_area->area) / (metres_per_texel * metres_per_texel);
+        const glm::dvec2 domain_min(domain_origin);
+        const glm::dvec2 domain_max = domain_min + glm::dvec2(domain_size);
+        if (m_settings.reset_on_next_run && (glm::any(glm::lessThan(release_area->min, domain_min)) || glm::any(glm::greaterThan(release_area->max, domain_max)))) {
+            // Seeding skips cells outside the domain, while the particles still share the whole
+            // release volume: the seeded snow would be denser than AvaFrame's.
+            qWarning().nospace() << "MpmSolverNode: release area " << QString::fromStdString(release_area->label) << " reaches outside the domain ("
+                                 << release_area->min.x << ", " << release_area->min.y << ")-(" << release_area->max.x << ", " << release_area->max.y
+                                 << ") m vs (" << domain_min.x << ", " << domain_min.y << ")-(" << domain_max.x << ", " << domain_max.y << ") m";
+        }
+    } else {
+        // Release zone, in region-relative metres. Clamped into the domain (with a margin for
+        // its own radius) so a slightly misplaced scenario still seeds instead of silently
+        // producing nothing.
+        const glm::dvec2 release_world = nucleus::srs::lat_long_to_world(m_settings.release_center);
+        data.release_mode = 0u;
+        data.release_radius = std::clamp(m_settings.release_radius, 1.0f, domain_size * 0.4f);
+        const float margin = data.release_radius + 2.0f * dx;
+        const glm::fvec2 release_centre = glm::clamp(glm::fvec2((release_world - region_aabb.min) * to_metres),
+            domain_origin + glm::fvec2(margin),
+            domain_origin + glm::fvec2(domain_size - margin));
+        data.release_centre_x = release_centre.x;
+        data.release_centre_y = release_centre.y;
+        data.release_half_y = data.release_radius;
+        data.release_volume = 0.0f;
+        data.release_max_depth = 0.0f;
+        const float release_radius_texels = std::max(data.release_radius / metres_per_texel, 1.0f);
+        release_area_texels = 3.14159265f * release_radius_texels * release_radius_texels;
+    }
 
-    // Reference coverage for full opacity. Derived from the release disc rather than the
+    // Reference coverage for full opacity. Derived from the release area rather than the
     // whole domain: the snow starts concentrated there, and basing the scale on the domain
     // would make a small avalanche in a large box saturate everywhere. The spread factor
     // keeps the runout visible as the same snow covers a larger area.
     constexpr float SPREAD_TOLERANCE = 6.0f;
     const float splat_area = 3.14159265f * radius_texels * radius_texels;
-    const float release_radius_texels = std::max(data.release_radius / metres_per_texel, 1.0f);
-    const float release_area = 3.14159265f * release_radius_texels * release_radius_texels;
-    data.density_reference = std::max(float(m_allocated_particles) * splat_area / (SPREAD_TOLERANCE * release_area), 1.0f);
+    data.density_reference = std::max(float(m_release_particles) * splat_area / (SPREAD_TOLERANCE * std::max(release_area_texels, 1.0f)), 1.0f);
 
     data.constitutive_model = static_cast<uint32_t>(m_settings.constitutive_model);
     data.basal_friction_model = static_cast<uint32_t>(m_settings.basal_friction_model);
     data.voellmy_xi = std::max(m_settings.voellmy_xi, 1.0f);
 
-    // Drucker-Prager cone slope from the friction angle (Klar et al. 2016, eq. after (27)):
+    // Drucker-Prager cone slope from the friction angle (Klar et al. 2016, section 7.3):
     // alpha = sqrt(2/3) * 2 sin(phi) / (3 - sin(phi)).
     const float sin_phi = std::sin(glm::radians(std::clamp(m_settings.dp_friction_angle, 0.0f, 89.0f)));
     data.dp_alpha = std::sqrt(2.0f / 3.0f) * 2.0f * sin_phi / (3.0f - sin_phi);
@@ -298,11 +595,50 @@ void MpmSolverNode::update_gpu_settings(const radix::geometry::Aabb<2, double>& 
     data.ccc_xi = std::max(m_settings.ccc_xi, 1e-6f);
     data.ccc_p0_initial = std::max(m_settings.ccc_p0_initial, 0.0f);
 
+    // Entrainment. The cover's slots are whatever was allocated beyond the release.
+    data.entrainment_mode = m_cover.mode != 0u ? uint32_t(m_settings.entrainment_mode) : 0u;
+    data.cover_mode = m_cover.mode;
+    data.release_particles = m_release_particles;
+    data.pool_particles = m_allocated_particles - m_release_particles;
+    data.cover_thickness = std::max(m_settings.cover_thickness, 0.0f);
+    data.cover_cos_max_slope = std::cos(glm::radians(std::clamp(m_settings.cover_max_slope, 0.0f, 85.0f)));
+    data.snow_density = std::max(m_settings.snow_density, 1.0f);
+    data.entrainment_density = std::max(m_settings.entrainment_density, 1.0f);
+    data.cover_density_ratio = data.entrainment_density / data.snow_density;
+    data.erosion_energy = std::max(m_settings.erosion_energy, 1.0f);
+    data.plowing_depth = std::max(m_settings.plowing_depth, 0.0f);
+    data.entrainment_min_speed = std::max(m_settings.entrainment_min_speed, 0.0f);
+
     m_settings_uniform.update_gpu_data(m_ctx->queue());
 
-    // World space bounds of the simulated area, so the result can be placed on the map.
-    const glm::dvec2 domain_min = region_aabb.min + glm::dvec2(domain_origin);
-    m_domain_aabb = { domain_min, domain_min + glm::dvec2(double(domain_size)) };
+    // World space bounds of the simulated area (back from metres to world units), so the result
+    // can be placed on the map. In the sandbox these are sandbox metres.
+    const glm::dvec2 domain_min = region_aabb.min + glm::dvec2(domain_origin) / to_metres;
+    m_domain_aabb = { domain_min, domain_min + glm::dvec2(double(domain_size)) / to_metres };
+
+    // Where a renderer puts the particles: the inverse of the metre conversion above, or the
+    // sandbox's own placement on the map.
+    if (sandbox != nullptr) {
+        m_particle_view.placed = sandbox->sandbox_to_world.has_value();
+        m_particle_view.world_from_metres = sandbox->sandbox_to_world.value_or(glm::dmat3(1.0));
+    } else {
+        const double world_per_metre = 1.0 / to_metres;
+        m_particle_view.placed = true;
+        m_particle_view.world_from_metres
+            = glm::dmat3(glm::dvec3(world_per_metre, 0.0, 0.0), glm::dvec3(0.0, world_per_metre, 0.0), glm::dvec3(region_aabb.min, 1.0));
+    }
+    // Spacing of the seeded particles: the release volume shared out. On the map the release
+    // is a disc of slab thickness (an upper bound, seeding keeps only the release slopes).
+    const double release_volume = sandbox != nullptr ? sandbox->release_volume
+        : release_area != nullptr
+        ? release_area->volume
+        : glm::pi<double>() * double(m_settings.release_radius) * double(m_settings.release_radius) * double(m_settings.slab_thickness);
+    m_particle_view.particle_spacing = float(std::cbrt(release_volume / double(std::max(m_settings.num_particles, 1u))));
+    m_particle_view.domain_origin = data.domain_origin;
+    m_particle_view.dx = data.dx;
+    m_particle_view.columns = glm::uvec2(data.grid_res);
+    m_particle_view.height_texture = &height_texture;
+    m_particle_view.region_size = region_size;
 }
 
 void MpmSolverNode::write_initial_state()
@@ -314,57 +650,182 @@ void MpmSolverNode::write_initial_state()
     std::memcpy(&initial[1], &max_init, sizeof(int32_t));
     initial[2] = 0u; // active particles
     initial[3] = 0u; // max speed
-    // slots 4..13 (plastic count, reserved, the four 64-bit sums) start at zero
+    // the rest (counts, seed hits, the 64-bit sums, clamp counters) starts at zero
 
     m_state_buffer->write(m_ctx->queue(), initial.data(), initial.size(), 0);
 }
 
 void MpmSolverNode::reset_run_counters()
 {
-    // slots 3..13: max speed, plastic count, reserved, four 64-bit sums (lo/hi each)
-    const std::array<uint32_t, 11> zeros {};
-    m_state_buffer->write(m_ctx->queue(), zeros.data(), zeros.size(), 3);
+    // Max speed and the yield count, the four instantaneous sums, the clamp counters. Not the
+    // seed hits and the path sum, which hold from the reset on.
+    const std::array<uint32_t, 8> zeros {};
+    m_state_buffer->write(m_ctx->queue(), zeros.data(), 2, 3);
+    m_state_buffer->write(m_ctx->queue(), zeros.data(), 8, STATE_SUM_X);
+    m_state_buffer->write(m_ctx->queue(), zeros.data(), 2, STATE_CEILING_CONTACTS);
 }
 
 void MpmSolverNode::read_back_state()
 {
+    // The run completes right away; the diagnostics arrive a frame or so later, as they always
+    // did. The map is issued first: completing the run can start the next one synchronously
+    // (queued runs, downstream nodes), and that one must see the staging buffer as busy.
+    if (m_readback_copied)
+        map_state_readback();
+    finish_run();
+}
+
+void MpmSolverNode::map_state_readback()
+{
+    m_readback_in_flight = true;
+
     // Stamp the sample with the time of the run it describes; the callback fires later.
-    const float time = m_simulated_time;
-    const float gravity = std::max(m_settings.gravity, 1e-3f);
+    struct Request {
+        std::shared_ptr<MpmSolverNode*> alive;
+        uint32_t reset_count;
+        float time;
+        float gravity;
+        uint32_t substeps;
+    };
+    auto* request = new Request { m_alive, m_reset_count, m_simulated_time, std::max(m_settings.gravity, 1e-3f), m_run_substeps_submitted };
 
-    m_state_buffer->read_back_async(m_ctx->device(), [this, alive = lifetime_token(), time, gravity](WGPUMapAsyncStatus status, std::vector<uint32_t> data) {
-        if (alive.expired() || status != WGPUMapAsyncStatus_Success || data.size() < SIM_STATE_SIZE_U32)
+    const auto on_mapped = [](WGPUMapAsyncStatus status, [[maybe_unused]] WGPUStringView message, void* userdata, [[maybe_unused]] void* userdata2) {
+        std::unique_ptr<Request> request(reinterpret_cast<Request*>(userdata));
+        MpmSolverNode* self = *request->alive;
+        if (self == nullptr)
+            return; // node destroyed while the map was pending; its buffer went with it
+        self->m_readback_in_flight = false;
+        if (status != WGPUMapAsyncStatus_Success) {
+            qWarning() << "MpmSolverNode: state readback failed, status" << int(status);
             return;
-        const auto as_i32 = [&data](size_t slot) {
-            int32_t value = 0;
-            std::memcpy(&value, &data[slot], sizeof(int32_t));
-            return value;
-        };
-        m_last_state.min_altitude = float(as_i32(0)) / 100.0f;
-        m_last_state.max_altitude = float(as_i32(1)) / 100.0f;
-        m_last_state.active_particles = data[2];
-        m_last_state.max_speed = float(data[3]) / 1000.0f;
-        m_last_state.plastic_particles = data[4];
-
-        const double active = std::max(double(m_last_state.active_particles), 1.0);
-        m_last_state.centre_of_mass = glm::dvec3(double(wide(data, 6)), double(wide(data, 8)), double(wide(data, 10))) / SUM_POSITION_SCALE / active;
-        m_last_state.mean_speed_sq = float(double(wide(data, 12)) / SUM_SPEED_SQ_SCALE / active);
-        m_last_state.valid = true;
-
-        if (m_last_state.active_particles == 0)
-            return;
-
-        // Energy line: path is the horizontal distance the centre of mass has covered.
-        float path = 0.0f;
-        if (!m_energy_line.empty()) {
-            const auto& previous = m_energy_line.back();
-            const glm::dvec2 delta = glm::dvec2(m_last_state.centre_of_mass) - m_last_com_xy;
-            path = previous.path + float(glm::length(delta));
         }
-        m_last_com_xy = glm::dvec2(m_last_state.centre_of_mass);
-        m_energy_line.push_back(EnergySample { time, path, float(m_last_state.centre_of_mass.z),
-            float(m_last_state.centre_of_mass.z) + m_last_state.mean_speed_sq / (2.0f * gravity) });
-    });
+        // A sample from before a reset would land in the fresh energy line; drop it.
+        self->on_state_mapped(request->time, request->gravity, request->substeps, request->reset_count == self->m_reset_count);
+    };
+
+    WGPUBufferMapCallbackInfo callback_info {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_mapped,
+        .userdata1 = request,
+        .userdata2 = nullptr,
+    };
+    wgpuBufferMapAsync(m_state_readback->handle(), WGPUMapMode_Read, 0, m_state_readback->size_in_byte(), callback_info);
+}
+
+void MpmSolverNode::on_state_mapped(float time, float gravity, uint32_t substeps, bool current)
+{
+    std::vector<uint32_t> data(SIM_STATE_SIZE_U32);
+    const auto* mapped = static_cast<const uint32_t*>(wgpuBufferGetConstMappedRange(m_state_readback->handle(), 0, m_state_readback->size_in_byte()));
+    if (mapped != nullptr)
+        std::memcpy(data.data(), mapped, data.size() * sizeof(uint32_t));
+    wgpuBufferUnmap(m_state_readback->handle());
+    if (mapped == nullptr || !current)
+        return;
+
+    const auto as_i32 = [&data](size_t slot) {
+        int32_t value = 0;
+        std::memcpy(&value, &data[slot], sizeof(int32_t));
+        return value;
+    };
+    m_last_state.min_altitude = float(as_i32(0)) / 100.0f;
+    m_last_state.max_altitude = float(as_i32(1)) / 100.0f;
+    m_last_state.active_particles = data[2];
+    m_last_state.max_speed = float(data[3]) / 1000.0f;
+    m_last_state.plastic_particles = data[4];
+
+    // Picked-up cover particles flow like release ones and are in every sum.
+    m_last_state.cover_volume = double(data[STATE_COVER_VOLUME]) / COVER_VOLUME_SCALE;
+    m_last_state.entrained_particles = std::min(data[STATE_ENTRAINED_PARTICLES], m_allocated_particles - m_release_particles);
+    m_last_state.pool_exhausted_volume = double(data[STATE_POOL_EXHAUSTED]) / COVER_VOLUME_SCALE;
+    const double active = std::max(double(m_last_state.active_particles) + double(m_last_state.entrained_particles), 1.0);
+    m_last_state.centre_of_mass = glm::dvec3(double(wide(data, STATE_SUM_X)), double(wide(data, STATE_SUM_Y)), double(wide(data, STATE_SUM_Z)))
+        / SUM_POSITION_SCALE / active;
+    m_last_state.mean_speed_sq = float(double(wide(data, STATE_SUM_SPEED_SQ)) / SUM_SPEED_SQ_SCALE / active);
+    m_last_state.mean_path = float(double(wide(data, STATE_SUM_PATH)) / SUM_PATH_SCALE / active);
+    m_last_state.ceiling_contacts = data[STATE_CEILING_CONTACTS];
+    m_last_state.wall_contacts = data[STATE_WALL_CONTACTS];
+    m_contacts_since_reset.ceiling += m_last_state.ceiling_contacts;
+    m_contacts_since_reset.wall += m_last_state.wall_contacts;
+    m_contacts_since_reset.particle_substeps += (uint64_t(m_last_state.active_particles) + m_last_state.entrained_particles) * substeps;
+    m_last_state.run_substeps = substeps;
+    m_last_state.release_area_share = float(double(data[STATE_SEED_FIRST_HITS]) / std::max(double(m_release_particles), 1.0));
+    m_last_state.particle_volume = particle_volume_from(data);
+    const double particle_mass = m_last_state.particle_volume * double(m_settings_uniform.data.snow_density);
+    m_last_state.cover_mass = m_last_state.cover_volume * double(m_settings_uniform.data.entrainment_density);
+    m_last_state.entrained_mass = double(m_last_state.entrained_particles) * particle_mass;
+    m_last_state.entrained_volume = m_last_state.entrained_mass / double(std::max(m_settings_uniform.data.entrainment_density, 1.0f));
+    m_last_state.valid = true;
+
+    // com1DFA's stop criterion on the kinetic energy (equal particle masses, so the mean of
+    // v^2 is proportional to it). The peak must be a real flow, not the settling of the seed.
+    m_peak_mean_speed_sq = std::max(m_peak_mean_speed_sq, m_last_state.mean_speed_sq);
+    m_at_rest = m_settings.stop_kinetic_fraction > 0.0f && m_peak_mean_speed_sq > 1.0f
+        && m_last_state.mean_speed_sq < m_settings.stop_kinetic_fraction * m_peak_mean_speed_sq;
+
+    if (m_last_state.active_particles > 0)
+        append_energy_sample(time, gravity);
+}
+
+const MpmRawView& MpmSolverNode::raw_view() const
+{
+    MpmRawView& view = m_raw_view;
+    view.particles = &m_particle_view;
+    view.grid_velocity = m_grid_velocity_buffer.get();
+    view.column_floor = m_column_floor_buffer.get();
+    view.grid_resolution = m_allocated_grid_res;
+    const auto& uniform = m_settings_uniform.data;
+    view.snow_density = uniform.snow_density;
+    // The real volume of a particle is only known once the diagnostics have been read back; the
+    // grid's mass is in units of the normalised particle mass (settings.particle_mass).
+    view.kg_per_mass_unit = float(m_last_state.particle_volume * double(uniform.snow_density) / double(std::max(uniform.particle_mass, 1e-12f)));
+    view.interpolation = m_particle_view.interpolation;
+    view.simulated_time = m_simulated_time;
+    view.generation = m_field_generation;
+    view.resource_generation = m_resource_generation;
+    return view;
+}
+
+double MpmSolverNode::particle_volume_from(const std::vector<uint32_t>& state) const
+{
+    // As seeded_particle_volume() in mpm_common.wgsl: the release volume shared out.
+    const auto& u = m_settings_uniform.data;
+    const double active = std::max(double(state[2]), 1.0);
+    if (u.release_mode == 1u)
+        return double(u.release_volume) / active;
+    const double share = double(state[STATE_SEED_FIRST_HITS]) / std::max(double(m_release_particles), 1.0);
+    return share * glm::pi<double>() * double(u.release_radius) * double(u.release_radius) * double(u.slab_thickness) / active;
+}
+
+void MpmSolverNode::append_energy_sample(float time, float gravity)
+{
+    // Energy line (Tonnel et al. 2023, App. A): every point loses mu of energy height per metre
+    // of its own path, so the average is over the particles' paths. The centre of mass's
+    // own path is shorter once the flow spreads, and would bias mu_eff high.
+    const float path = m_last_state.mean_path;
+    m_energy_line.push_back(EnergySample { time, path, float(m_last_state.centre_of_mass.z),
+        float(m_last_state.centre_of_mass.z) + m_last_state.mean_speed_sq / (2.0f * gravity) });
+
+    // Keep it bounded: drop every other sample (never the latest). Path and time stay
+    // monotonic, so the least-squares fit is unaffected apart from its sample count.
+    if (m_energy_line.size() > MAX_ENERGY_SAMPLES) {
+        std::vector<EnergySample> halved;
+        halved.reserve(MAX_ENERGY_SAMPLES / 2 + 1);
+        for (size_t i = 0; i < m_energy_line.size(); i += 2)
+            halved.push_back(m_energy_line[i]);
+        if ((m_energy_line.size() - 1) % 2 != 0)
+            halved.push_back(m_energy_line.back());
+        m_energy_line = std::move(halved);
+    }
+}
+
+void MpmSolverNode::finish_run()
+{
+    const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - m_run_started).count();
+    m_perf.last_run_ms = ms;
+    m_perf.mean_run_ms = m_perf.runs == 0 ? ms : 0.9f * m_perf.mean_run_ms + 0.1f * ms;
+    m_perf.runs++;
+    complete_run();
 }
 
 float MpmSolverNode::energy_line_friction() const
@@ -396,6 +857,21 @@ float MpmSolverNode::energy_line_friction() const
     return float(-slope);
 }
 
+const SandboxTerrain* MpmSolverNode::sandbox()
+{
+    if (!input_socket("sandbox").is_socket_connected())
+        return nullptr;
+    return std::get<data_type<const SandboxTerrain*>()>(input_socket("sandbox").get_connected_data());
+}
+
+const ReleaseArea* MpmSolverNode::release_area()
+{
+    if (!input_socket("release area").is_socket_connected())
+        return nullptr;
+    const auto* area = std::get<data_type<const ReleaseArea*>()>(input_socket("release area").get_connected_data());
+    return area != nullptr && area->depth_texture != nullptr && area->volume > 0.0 ? area : nullptr;
+}
+
 bool MpmSolverNode::has_valid_inputs()
 {
     static constexpr const char* REQUIRED[] = { "region aabb", "height texture", "release point texture" };
@@ -412,11 +888,70 @@ bool MpmSolverNode::has_valid_inputs()
         return false;
     if (std::get<data_type<const webgpu::raii::TextureWithSampler*>()>(input_socket("release point texture").get_connected_data()) == nullptr)
         return false;
+    // Optional, but once connected it has to be there: without it the region would be taken
+    // for Web Mercator.
+    if (input_socket("sandbox").is_socket_connected() && sandbox() == nullptr)
+        return false;
     return true;
+}
+
+bool MpmSolverNode::can_advance() const
+{
+    // has_valid_inputs() only reads the sockets; Node has no const access to connected data.
+    return const_cast<MpmSolverNode*>(this)->has_valid_inputs();
+}
+
+void MpmSolverNode::advance(uint32_t steps, uint32_t chunks)
+{
+    m_advance_substeps = steps;
+    m_advance_chunks = chunks;
+    m_advance_frame = false;
+    rerun();
+}
+
+bool MpmSolverNode::advance_frame(uint32_t steps, bool end_run)
+{
+    // A GPU that is behind refuses the frame's chunk rather than queue more: the simulation falls
+    // behind instead of the frame rate. A chunk's work-done callback arrives about two frames
+    // after its submission, so two in flight is the steady state of one chunk per frame.
+    if (m_gpu_chunks_in_flight >= MAX_FRAME_CHUNKS_IN_FLIGHT)
+        return false;
+    if (!m_frame_run_open) {
+        if (is_running() || steps == 0)
+            return false; // an advance() run is under way, or nothing to open a run with
+        m_advance_substeps = steps;
+        m_advance_chunks = 1;
+        m_advance_frame = true;
+        m_advance_end_run = end_run;
+        const uint64_t serial = m_run_serial;
+        rerun();
+        return m_run_serial != serial; // the run did not start (inputs missing, node disabled)
+    }
+    submit_chunk(steps, end_run);
+    if (end_run)
+        close_frame_run();
+    return true;
+}
+
+void MpmSolverNode::close_frame_run()
+{
+    m_frame_run_open = false;
+    read_back_state(); // the map waits for the GPU itself; the run is done for the clock
 }
 
 void MpmSolverNode::run_impl()
 {
+    // An advance() override is for this run only, whether it succeeds or not.
+    const uint32_t run_substeps = std::clamp(m_advance_substeps > 0 ? m_advance_substeps : m_settings.substeps_per_run, 1u, 4096u);
+    const uint32_t per_submit = std::clamp(m_settings.substeps_per_submit, 1u, 4096u);
+    const uint32_t run_chunks = m_advance_chunks > 0 ? m_advance_chunks : (run_substeps + per_submit - 1u) / per_submit;
+    const bool per_frame = m_advance_substeps > 0 && m_advance_frame;
+    const bool frame_end_run = m_advance_end_run;
+    m_advance_substeps = 0;
+    m_advance_chunks = 0;
+    m_advance_frame = false;
+    m_advance_end_run = false;
+
     if (!has_valid_inputs()) {
         fail_run("MpmSolverNode inputs are not ready. Run the full graph (Shift+R) before stepping the solver.");
         return;
@@ -427,75 +962,180 @@ void MpmSolverNode::run_impl()
     const auto& release_point_texture
         = *std::get<data_type<const webgpu::raii::TextureWithSampler*>()>(input_socket("release point texture").get_connected_data());
 
+    m_run_started = std::chrono::steady_clock::now();
+    const SandboxTerrain* sandbox_terrain = sandbox();
+    // On the map, release areas given per cell take the place of the release point mask: the
+    // seed reads its depth from the same binding, as in the sandbox.
+    const ReleaseArea* map_release = sandbox_terrain == nullptr ? release_area() : nullptr;
+    // The snow cover is planned for each seed, before the buffers are sized: its slots come
+    // after the release particles. Reallocating forces a seed, which then needs its plan too.
+    const bool planned = m_settings.reset_on_next_run;
+    if (planned)
+        plan_cover(sandbox_terrain, map_release);
     ensure_resources();
-    update_gpu_settings(*region_aabb, height_texture);
-    // The input textures may be recreated by upstream nodes between runs, so the bind
-    // group is rebuilt every time rather than cached.
-    create_bind_group(height_texture, release_point_texture);
+    if (m_settings.reset_on_next_run && !planned) {
+        plan_cover(sandbox_terrain, map_release);
+        ensure_resources();
+    }
+    // The texture of a planned cover is the upstream node's, which it recreates whenever it runs:
+    // take it from the input again each run, never a pointer kept from the seed.
+    if (m_cover.mode == 1u) {
+        m_cover.texture = sandbox_terrain != nullptr ? sandbox_terrain->entrainment_texture
+            : map_release != nullptr                 ? map_release->entrainment_texture
+                                                     : nullptr;
+        if (m_cover.texture == nullptr)
+            m_cover.mode = 0u; // gone (input disconnected): the dormant cover stays where it is
+    }
+    update_gpu_settings(*region_aabb, height_texture, sandbox_terrain, map_release);
+    ensure_bind_group(height_texture, map_release != nullptr ? *map_release->depth_texture : release_point_texture);
 
     const bool reset = m_settings.reset_on_next_run;
     if (reset) {
         write_initial_state();
         m_simulated_time = 0.0f;
+        m_reset_wall_start = std::chrono::steady_clock::now();
         m_last_state = {};
+        m_peak_mean_speed_sq = 0.0f;
+        m_contacts_since_reset = {};
+        m_at_rest = false;
         m_energy_line.clear();
+        m_perf.runs = 0;
+        m_reset_count++;
+        m_particle_view.reset_count = m_reset_count;
 
-        // Report where on the planet we are actually simulating - without this there is no
-        // way to tell from the UI which slope the domain landed on.
-        const glm::dvec2 south_west = nucleus::srs::world_to_lat_long(m_domain_aabb.min);
-        const glm::dvec2 north_east = nucleus::srs::world_to_lat_long(m_domain_aabb.max);
-        const glm::dvec2 centre = nucleus::srs::world_to_lat_long((m_domain_aabb.min + m_domain_aabb.max) * 0.5);
-        qInfo().nospace() << "MpmSolverNode: simulating " << m_settings.domain_size_xy << " m domain at centre " << centre.x << ", " << centre.y
-                          << " (lat " << south_west.x << ".." << north_east.x << ", lon " << south_west.y << ".." << north_east.y << "), "
-                          << m_allocated_grid_res.x << "x" << m_allocated_grid_res.y << " grid, " << m_allocated_grid_res.z << " layers, dx "
-                          << m_settings_uniform.data.dx << " m, " << m_allocated_particles << " particles";
+        // Report where we are actually simulating - without this there is no way to tell from
+        // the UI which slope the domain landed on.
+        if (sandbox_terrain != nullptr) {
+            const auto& d = m_settings_uniform.data;
+            qInfo().nospace() << "MpmSolverNode: sandbox " << QString::fromStdString(sandbox_terrain->name) << " / "
+                              << QString::fromStdString(sandbox_terrain->scenario) << ", " << d.domain_size_xy << " m domain at (" << d.domain_origin.x
+                              << ", " << d.domain_origin.y << ") m, " << m_allocated_grid_res.x << "x" << m_allocated_grid_res.y << " grid, "
+                              << m_allocated_grid_res.z << " layers, dx " << d.dx << " m, " << m_allocated_particles << " particles, release "
+                              << d.release_volume << " m3";
+        } else {
+            const glm::dvec2 south_west = nucleus::srs::world_to_lat_long(m_domain_aabb.min);
+            const glm::dvec2 north_east = nucleus::srs::world_to_lat_long(m_domain_aabb.max);
+            const glm::dvec2 centre = nucleus::srs::world_to_lat_long((m_domain_aabb.min + m_domain_aabb.max) * 0.5);
+            qInfo().nospace() << "MpmSolverNode: simulating " << m_settings.domain_size_xy << " m domain at centre " << centre.x << ", " << centre.y
+                              << " (lat " << south_west.x << ".." << north_east.x << ", lon " << south_west.y << ".." << north_east.y << "), "
+                              << m_allocated_grid_res.x << "x" << m_allocated_grid_res.y << " grid, " << m_allocated_grid_res.z << " layers, dx "
+                              << m_settings_uniform.data.dx << " m, " << m_allocated_particles << " particles, " << m_metres_per_world_unit
+                              << " m per world unit";
+        }
     } else {
         // Per-run counters only; the terrain scan and seed count from the reset must survive.
         reset_run_counters();
     }
 
-    m_run_substeps_left = std::clamp(m_settings.substeps_per_run, 1u, 4096u);
+    m_run_substeps_left = run_substeps;
+    m_run_substeps = run_substeps;
+    m_run_substeps_submitted = 0;
+    m_run_chunks = std::clamp(run_chunks, 1u, run_substeps);
+    m_run_chunk_index = 0;
+    m_run_per_frame = per_frame;
+    m_run_serial++;
     m_run_first_chunk = true;
     m_run_is_reset = reset;
+    // Particles cache the stress G2P computed with the previous parameters; after a material
+    // edit that kept them, recompute it before the first P2G (a reseed computes it anyway).
+    const auto& u = m_settings_uniform.data;
+    const std::array<float, 11> stress_parameters { u.mu_0, u.lambda_0, u.hardening, u.critical_compression, u.critical_stretch,
+        float(u.constitutive_model), u.dp_alpha, u.ccc_m, u.ccc_beta, u.ccc_xi, u.ccc_p0_initial };
+    m_run_refresh_stress = !reset && stress_parameters != m_stress_parameters;
+    // The peak velocity is for the comparison with AvaFrame; the map run skips the extra pass.
+    m_run_column_stats = sandbox_terrain != nullptr;
+    m_stress_parameters = stress_parameters;
+    m_readback_copied = false;
     m_settings.reset_on_next_run = false;
     m_chunks_in_flight = 0;
+    if (m_run_per_frame) {
+        // A real-time run: this chunk now, the next ones from advance_frame(), one per frame.
+        // It is done for the clock once the last one is submitted (close_frame_run() right
+        // after it), so the next run starts in the next frame and every frame gets a chunk.
+        m_frame_run_open = true;
+        m_run_substeps_left = 0;
+        submit_chunk(run_substeps, frame_end_run);
+        if (frame_end_run)
+            close_frame_run();
+        return;
+    }
     // Two chunks in flight: the work-done callback of one arrives two frames after its
     // submission (GPU finish, then the next event pump), so a single chunk in flight would
     // leave the queue idle every other frame. With two, a frame always finds one chunk
     // ahead of its own command buffer and never more.
-    submit_chunk();
+    submit_chained_chunk();
     if (m_run_substeps_left > 0)
-        submit_chunk();
+        submit_chained_chunk();
 }
 
-void MpmSolverNode::submit_chunk()
+void MpmSolverNode::submit_chained_chunk()
+{
+    // Chunk i of n gets floor((i + 1) S / n) - floor(i S / n) of the S substeps: they differ by
+    // at most one, and the larger ones are spread out rather than bunched at one end.
+    const uint64_t total = m_run_substeps;
+    const uint64_t index = std::min(m_run_chunk_index, m_run_chunks - 1u);
+    const uint32_t planned = index + 1u >= m_run_chunks ? m_run_substeps_left
+                                                         : uint32_t((index + 1u) * total / m_run_chunks - index * total / m_run_chunks);
+    const uint32_t substeps = std::clamp(planned, 1u, m_run_substeps_left);
+    m_run_chunk_index++;
+    m_run_substeps_left -= substeps;
+    submit_chunk(substeps, m_run_substeps_left == 0);
+}
+
+void MpmSolverNode::submit_chunk(uint32_t substeps, bool last_chunk)
 {
     const glm::uvec3 particle_workgroups(div_ceil(m_allocated_particles, PARTICLE_WORKGROUP_SIZE.x), 1, 1);
-    const glm::uvec3 grid_workgroups(div_ceil(m_allocated_grid_res.x, GRID_WORKGROUP_SIZE.x),
-        div_ceil(m_allocated_grid_res.y, GRID_WORKGROUP_SIZE.y),
-        div_ceil(m_allocated_grid_res.z, GRID_WORKGROUP_SIZE.z));
-    const uint32_t grid_node_count = m_allocated_grid_res.x * m_allocated_grid_res.y * m_allocated_grid_res.z;
-    const glm::uvec3 grid_clear_workgroups(div_ceil(grid_node_count, PARTICLE_WORKGROUP_SIZE.x), 1, 1);
+    // One workgroup per tile of columns; each thread walks the layers of its column.
+    const glm::uvec3 grid_workgroups(div_ceil(m_allocated_grid_res.x, GRID_WORKGROUP_SIZE.x), div_ceil(m_allocated_grid_res.y, GRID_WORKGROUP_SIZE.y), 1);
     const glm::uvec3 prepare_workgroups(
         div_ceil(m_allocated_grid_res.x, RASTER_WORKGROUP_SIZE.x), div_ceil(m_allocated_grid_res.y, RASTER_WORKGROUP_SIZE.y), 1);
     const glm::uvec3 raster_workgroups(
         div_ceil(m_output_dimensions.x, RASTER_WORKGROUP_SIZE.x), div_ceil(m_output_dimensions.y, RASTER_WORKGROUP_SIZE.y), 1);
 
-    const uint32_t substeps = std::min(m_run_substeps_left, std::clamp(m_settings.substeps_per_submit, 1u, 4096u));
-    m_run_substeps_left -= substeps;
-    const bool last_chunk = m_run_substeps_left == 0;
-
     WGPUCommandEncoderDescriptor encoder_desc {};
     encoder_desc.label = WGPUStringView { .data = "mpm solver command encoder", .length = WGPU_STRLEN };
     webgpu::raii::CommandEncoder encoder(m_ctx->device(), encoder_desc);
 
+    // Real time keeps the particles from before each chunk, for the renderer to interpolate
+    // between them and the new ones. Not on a reseed (the copy would hold the old flow, the seed
+    // runs inside the pass) and not in accuracy playback; an empty chunk leaves them as they are.
+    if (substeps > 0) {
+        const bool keep = m_run_per_frame && !(m_run_first_chunk && m_run_is_reset);
+        if (keep)
+            m_particle_buffer->copy_to_buffer(encoder.handle(), *m_previous_particles);
+        m_particle_view.previous_particles = keep ? m_previous_particles.get() : nullptr;
+        m_field_generation++;
+    }
+
     // Cleared outside the compute pass; the density raster only accumulates once per run.
     if (m_run_first_chunk)
         m_density_buffer->clear(encoder.handle());
+    // The grid update zeroes the accumulators it consumed, so the grid stays clean from one
+    // substep to the next without a clear pass. A reseed starts from a known state anyway,
+    // in case a previous run was abandoned half way (graph replaced, device hiccup).
+    if (m_run_first_chunk && m_run_is_reset) {
+        m_grid_buffer->clear(encoder.handle());
+        // The tiles of the previous flow are not flagged any more, so the grid update would never
+        // clear their velocities (see TILE_WAS_ACTIVE in mpm_common.wgsl).
+        m_grid_velocity_buffer->clear(encoder.handle());
+        m_tile_flag_buffer->clear(encoder.handle());
+        m_column_peak_buffer->clear(encoder.handle());
+    }
+
+    // Time this chunk if its timestamp slot is free (its readback from two chunks ago is done).
+    const int slot = int(m_chunk_counter++ % TIMESTAMP_SLOTS);
+    const int timestamp_slot = (m_timestamp_queries != nullptr && !m_timestamp_busy[size_t(slot)]) ? slot : -1;
+    WGPUPassTimestampWrites timestamp_writes {};
+    if (timestamp_slot >= 0) {
+        timestamp_writes.querySet = m_timestamp_queries;
+        timestamp_writes.beginningOfPassWriteIndex = uint32_t(2 * timestamp_slot);
+        timestamp_writes.endOfPassWriteIndex = uint32_t(2 * timestamp_slot + 1);
+    }
 
     {
         WGPUComputePassDescriptor compute_pass_desc {};
         compute_pass_desc.label = WGPUStringView { .data = "mpm solver compute pass", .length = WGPU_STRLEN };
+        compute_pass_desc.timestampWrites = timestamp_slot >= 0 ? &timestamp_writes : nullptr;
         webgpu::raii::ComputePassEncoder compute_pass(encoder.handle(), compute_pass_desc);
 
         // Every pipeline shares the layout, so the bind group is set once for the pass.
@@ -504,21 +1144,46 @@ void MpmSolverNode::submit_chunk()
         if (m_run_first_chunk && m_run_is_reset) {
             m_prepare_pipeline->run(compute_pass, prepare_workgroups);
             m_seed_pipeline->run(compute_pass, particle_workgroups);
+        } else if (m_run_first_chunk && m_run_refresh_stress) {
+            m_refresh_stress_pipeline->run(compute_pass, particle_workgroups);
+        }
+
+        // P2G reads the particles in tile order. Sorted once per chunk: in a chunk's substeps a
+        // particle moves well under a sort tile, and a stale order only costs speed.
+        if (substeps > 0) {
+            m_sort_count_pipeline->run(compute_pass, particle_workgroups);
+            m_sort_scan_pipeline->run(compute_pass, glm::uvec3(1, 1, 1));
+            m_sort_scatter_pipeline->run(compute_pass, particle_workgroups);
         }
 
         // Dispatches within one compute pass are ordered and see each other's storage
         // writes, which is exactly the dependency chain an MPM substep needs.
         for (uint32_t step = 0; step < substeps; step++) {
-            m_clear_grid_pipeline->run(compute_pass, grid_clear_workgroups);
             m_p2g_pipeline->run(compute_pass, particle_workgroups);
             m_grid_update_pipeline->run(compute_pass, grid_workgroups);
             m_g2p_pipeline->run(compute_pass, particle_workgroups);
+            if (m_run_column_stats)
+                m_column_stats_pipeline->run(compute_pass, particle_workgroups);
         }
 
         if (last_chunk) {
             m_splat_pipeline->run(compute_pass, particle_workgroups);
             m_rasterize_pipeline->run(compute_pass, raster_workgroups);
         }
+    }
+
+    if (timestamp_slot >= 0) {
+        const size_t offset = size_t(timestamp_slot) * TIMESTAMP_SLOT_STRIDE_BYTES;
+        wgpuCommandEncoderResolveQuerySet(encoder.handle(), m_timestamp_queries, uint32_t(2 * timestamp_slot), 2, m_timestamp_resolve->handle(), offset);
+        m_timestamp_resolve->copy_to_buffer(encoder.handle(), offset, *m_timestamp_readback[size_t(timestamp_slot)], 0, 2 * sizeof(uint64_t));
+        m_timestamp_busy[size_t(timestamp_slot)] = true;
+    }
+
+    // Diagnostics ride along in the last chunk's command buffer. Skipped while the staging
+    // buffer is still mapped from an earlier run - a buffer cannot be written while mapped.
+    if (last_chunk && !m_readback_in_flight) {
+        m_state_buffer->copy_to_buffer(encoder.handle(), *m_state_readback);
+        m_readback_copied = true;
     }
 
     WGPUCommandBufferDescriptor cmd_buffer_desc {};
@@ -528,22 +1193,158 @@ void MpmSolverNode::submit_chunk()
     wgpuCommandBufferRelease(command);
 
     m_run_first_chunk = false;
+    m_run_substeps_submitted += substeps;
     m_chunks_in_flight++;
+    m_gpu_chunks_in_flight++;
     m_simulated_time += float(substeps) * m_settings.dt;
 
     // The callback fires from the app's event pump, i.e. once per frame - which is what
     // lets a rendered frame slip in between two chunks.
-    on_submitted_work_done(m_ctx->queue(), [this]() {
-        m_chunks_in_flight--;
-        if (m_run_substeps_left > 0) {
-            submit_chunk();
+    // The userdata is a heap copy of m_alive rather than `this`: if the graph is replaced
+    // while a chunk is in flight, the node is gone by the time the callback runs.
+    struct ChunkDone {
+        std::shared_ptr<MpmSolverNode*> alive;
+        int timestamp_slot;
+        uint32_t substeps;
+        uint64_t run_serial;
+    };
+    const auto on_work_done
+        = []([[maybe_unused]] WGPUQueueWorkDoneStatus status, [[maybe_unused]] WGPUStringView message, void* userdata, [[maybe_unused]] void* userdata2) {
+              std::unique_ptr<ChunkDone> done(reinterpret_cast<ChunkDone*>(userdata));
+              if (MpmSolverNode* self = *done->alive)
+                  self->on_chunk_done(done->timestamp_slot, done->substeps, done->run_serial);
+          };
+
+    WGPUQueueWorkDoneCallbackInfo callback_info {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_work_done,
+        .userdata1 = new ChunkDone { m_alive, timestamp_slot, substeps, m_run_serial },
+        .userdata2 = nullptr,
+    };
+
+    wgpuQueueOnSubmittedWorkDone(m_ctx->queue(), callback_info);
+}
+
+void MpmSolverNode::on_chunk_done(int timestamp_slot, uint32_t substeps, uint64_t run_serial)
+{
+    if (timestamp_slot >= 0)
+        read_back_timestamps(timestamp_slot, substeps);
+
+    if (m_gpu_chunks_in_flight > 0)
+        m_gpu_chunks_in_flight--;
+    // A PerFrame run is finished when its last chunk is submitted, so its late callbacks may
+    // arrive during the next run; only the current chained run continues here.
+    if (run_serial != m_run_serial || m_run_per_frame)
+        return;
+    m_chunks_in_flight--;
+    if (m_run_substeps_left > 0) {
+        submit_chained_chunk();
+        return;
+    }
+    if (m_chunks_in_flight > 0)
+        return; // the last chunk is still running; its own callback finishes the run
+    read_back_state();
+}
+
+void MpmSolverNode::read_back_timestamps(int slot, uint32_t substeps)
+{
+    struct Request {
+        std::shared_ptr<MpmSolverNode*> alive;
+        int slot;
+        uint32_t substeps;
+    };
+    const auto on_mapped = [](WGPUMapAsyncStatus status, [[maybe_unused]] WGPUStringView message, void* userdata, [[maybe_unused]] void* userdata2) {
+        std::unique_ptr<Request> request(reinterpret_cast<Request*>(userdata));
+        MpmSolverNode* self = *request->alive;
+        if (self == nullptr)
+            return;
+        auto& buffer = *self->m_timestamp_readback[size_t(request->slot)];
+        if (status == WGPUMapAsyncStatus_Success) {
+            const auto* ticks = static_cast<const uint64_t*>(wgpuBufferGetConstMappedRange(buffer.handle(), 0, buffer.size_in_byte()));
+            // Timestamps can come back reset or out of order (e.g. power state changes);
+            // such a sample is dropped rather than averaged in.
+            if (ticks != nullptr && ticks[1] > ticks[0]) {
+                const float ms = float(double(ticks[1] - ticks[0]) / 1.0e6) / float(std::max(request->substeps, 1u));
+                auto& average = self->m_perf.gpu_ms_per_substep;
+                average = average <= 0.0f ? ms : 0.8f * average + 0.2f * ms;
+            }
+            wgpuBufferUnmap(buffer.handle());
+        }
+        self->m_timestamp_busy[size_t(request->slot)] = false;
+    };
+
+    WGPUBufferMapCallbackInfo callback_info {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_mapped,
+        .userdata1 = new Request { m_alive, slot, substeps },
+        .userdata2 = nullptr,
+    };
+    auto& buffer = *m_timestamp_readback[size_t(slot)];
+    wgpuBufferMapAsync(buffer.handle(), WGPUMapMode_Read, 0, buffer.size_in_byte(), callback_info);
+}
+
+void MpmSolverNode::read_back_peaks(std::function<void(const ColumnPeaks&)> callback)
+{
+    if (!m_column_peak_buffer)
+        return;
+    // Own staging buffer per request, kept alive by the request itself: the node (and its
+    // buffers) may be replaced while the map is pending.
+    struct Request {
+        std::shared_ptr<MpmSolverNode*> alive;
+        std::shared_ptr<webgpu::raii::RawBuffer<uint32_t>> staging;
+        std::function<void(const ColumnPeaks&)> callback;
+        ColumnPeaks peaks;
+    };
+    auto* request = new Request { m_alive,
+        std::make_shared<webgpu::raii::RawBuffer<uint32_t>>(m_ctx->device(), WGPUBufferUsage(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst),
+            m_column_peak_buffer->size(), "mpm column peaks readback"),
+        std::move(callback), {} };
+    request->peaks.size = glm::uvec2(m_allocated_grid_res);
+    request->peaks.domain_origin = glm::dvec2(m_settings_uniform.data.domain_origin);
+    request->peaks.dx = m_settings_uniform.data.dx;
+    request->peaks.simulated_time = m_simulated_time;
+
+    WGPUCommandEncoderDescriptor encoder_desc {};
+    encoder_desc.label = WGPUStringView { .data = "mpm peaks readback encoder", .length = WGPU_STRLEN };
+    webgpu::raii::CommandEncoder encoder(m_ctx->device(), encoder_desc);
+    m_column_peak_buffer->copy_to_buffer(encoder.handle(), *request->staging);
+    WGPUCommandBufferDescriptor cmd_buffer_desc {};
+    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder.handle(), &cmd_buffer_desc);
+    wgpuQueueSubmit(m_ctx->queue(), 1, &command);
+    wgpuCommandBufferRelease(command);
+
+    const auto on_mapped = [](WGPUMapAsyncStatus status, [[maybe_unused]] WGPUStringView message, void* userdata, [[maybe_unused]] void* userdata2) {
+        std::unique_ptr<Request> request(reinterpret_cast<Request*>(userdata));
+        if (*request->alive == nullptr)
+            return;
+        if (status != WGPUMapAsyncStatus_Success) {
+            qWarning() << "MpmSolverNode: peak readback failed, status" << int(status);
             return;
         }
-        if (m_chunks_in_flight > 0)
-            return; // the last chunk is still running; its own callback finishes the run
-        read_back_state();
-        complete_run();
-    });
+        auto& staging = *request->staging;
+        const auto* mapped = static_cast<const float*>(wgpuBufferGetConstMappedRange(staging.handle(), 0, staging.size_in_byte()));
+        auto& peaks = request->peaks;
+        const size_t columns = size_t(peaks.size.x) * peaks.size.y;
+        peaks.depth.resize(columns);
+        peaks.speed.resize(columns);
+        for (size_t i = 0; mapped != nullptr && i < columns; i++) {
+            peaks.depth[i] = mapped[COLUMN_STATS_STRIDE_U32 * i];
+            peaks.speed[i] = mapped[COLUMN_STATS_STRIDE_U32 * i + 1];
+        }
+        wgpuBufferUnmap(staging.handle());
+        if (mapped != nullptr)
+            request->callback(peaks);
+    };
+    WGPUBufferMapCallbackInfo callback_info {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_mapped,
+        .userdata1 = request,
+        .userdata2 = nullptr,
+    };
+    wgpuBufferMapAsync(request->staging->handle(), WGPUMapMode_Read, 0, request->staging->size_in_byte(), callback_info);
 }
 
 std::unique_ptr<webgpu::raii::TextureWithSampler> MpmSolverNode::create_output_texture(WGPUDevice device, uint32_t width, uint32_t height)
@@ -609,6 +1410,15 @@ void MpmSolverNode::serialize_settings(QJsonObject& out) const
     out["release_radius"] = s.release_radius;
     out["random_seed"] = static_cast<int>(s.random_seed);
     out["seed_anywhere"] = s.seed_anywhere;
+    out["stop_kinetic_fraction"] = s.stop_kinetic_fraction;
+    out["entrainment_mode"] = static_cast<int>(s.entrainment_mode);
+    out["entrainment_density"] = s.entrainment_density;
+    out["erosion_energy"] = s.erosion_energy;
+    out["plowing_depth"] = s.plowing_depth;
+    out["entrainment_min_speed"] = s.entrainment_min_speed;
+    out["cover_thickness"] = s.cover_thickness;
+    out["cover_max_slope"] = s.cover_max_slope;
+    out["pool_size"] = s.pool_size;
 }
 
 void MpmSolverNode::deserialize_settings(const QJsonObject& in)
@@ -651,6 +1461,15 @@ void MpmSolverNode::deserialize_settings(const QJsonObject& in)
     s.release_center.y = read_double("release_center_lon", s.release_center.y);
     s.release_radius = read_float("release_radius", s.release_radius);
     s.random_seed = read_uint("random_seed", s.random_seed);
+    s.stop_kinetic_fraction = read_float("stop_kinetic_fraction", s.stop_kinetic_fraction);
+    s.entrainment_mode = static_cast<EntrainmentMode>(std::min(read_uint("entrainment_mode", s.entrainment_mode), uint32_t(EROSION)));
+    s.entrainment_density = read_float("entrainment_density", s.entrainment_density);
+    s.erosion_energy = read_float("erosion_energy", s.erosion_energy);
+    s.plowing_depth = read_float("plowing_depth", s.plowing_depth);
+    s.entrainment_min_speed = read_float("entrainment_min_speed", s.entrainment_min_speed);
+    s.cover_thickness = read_float("cover_thickness", s.cover_thickness);
+    s.cover_max_slope = read_float("cover_max_slope", s.cover_max_slope);
+    s.pool_size = read_float("pool_size", s.pool_size);
     if (in.contains("seed_anywhere"))
         s.seed_anywhere = in["seed_anywhere"].toBool(s.seed_anywhere);
     s.reset_on_next_run = true;

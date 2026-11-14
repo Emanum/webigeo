@@ -18,20 +18,14 @@
 
 ///use mpm_common
 
-// Resets the background grid at the start of every MPM substep. This is a compute kernel
-// rather than a buffer clear so that a whole run - all substeps, the splat and the
-// rasterisation - fits into a single compute pass.
+// Particle sort, pass 3 of 3: every particle takes the next position of its bucket. The order
+// within a bucket follows the scheduling of this pass; P2G does not depend on it.
 
 @compute @workgroup_size(256, 1, 1)
 fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
-    let node_count = settings.grid_res.x * settings.grid_res.y * settings.grid_res.z;
-    if id.x >= node_count {
+    if id.x >= settings.num_particles {
         return;
     }
-
-    atomicStore(&grid[id.x].mass_lo, 0u);
-    atomicStore(&grid[id.x].mass_hi, 0u);
-    atomicStore(&grid[id.x].vx, 0);
-    atomicStore(&grid[id.x].vy, 0);
-    atomicStore(&grid[id.x].vz, 0);
+    let position = atomicAdd(&tile_flags[sort_cursors_offset() + sort_bucket(particles[id.x])], 1u);
+    atomicStore(&tile_flags[sorted_indices_offset() + position], id.x);
 }

@@ -13,6 +13,1000 @@ capture of the terminal.
 
 ---
 
+## 2026-11-13 — AvaFrame data: runtime-only downloads, kept in the browser (IDBFS)
+
+**Downloads.** The app downloaded `LINES/path_aimec.shp` and `POINTS/splitPoint.shp` per dataset
+only to write `path.json`, which nothing in the app reads (AIMEC, the offline comparison, takes
+them from the AvaFrame clone). Removed from `files_of()` and from `prepare()`: 72 → 62 files.
+The script `prepare_dataset.py` still writes `path.json`. (An earlier count of 60 was wrong.)
+
+**Web storage.** The web build's sandbox folder lived in Emscripten's in-memory file system and was
+gone after every reload. Now `AvaFrameData.{h,cpp}` has `persistent_storage_begin/ready/flush`
+(web: IDBFS mounted on the sandbox root, `-lidbfs.js` in `apps/webgpu_app/CMakeLists.txt`; native:
+no-ops). `AvalanchePanel::ready()` waits for the load (`wait_for_stored_data`, a 50 ms QTimer poll)
+before the first scan and the autostart, so AvaFrame's release areas are found. Flushes: after a
+finished download and after each exported sandbox run. A marker file `.avaframe_commit` records the
+AvaFrame commit; data of another commit is dropped by removing `index.json` (runs stay).
+
+**Checked.** Native and web builds compile and link; in the browser the IDBFS mount works
+(`alpSandboxStorage` = 1), files written to the sandbox folder survive a reload, and the old-commit
+marker removed `index.json` with debug builds. **Not verified:** the full download in the browser,
+and the flush after the discard (the last runs happened while the Browser pane was hidden: the page's
+animation loop is paused then, so the QTimer-driven startup never ran).
+
+## 2026-11-09
+
+### 1. Notes to self and private links removed from the docs
+
+Living docs only (dated reports and audits unchanged). "For the report" asides removed or
+turned into plain statements (01, 04, 05, 06, refs); private claude.ai artifact links and
+Notion pointers removed, since outside readers cannot open them (07, 12, 15, avaframe/README;
+06 keeps the shader verification report's title without "Notion"); author-directed wording
+("traps baked in so they aren't rediscovered", "keep in your head", "learned the hard way")
+rephrased (02, 05, 07).
+
+### 2. Raw grid view for the streamline project (branch `vector-field`)
+
+Our side of the hand-over to Elena Jochum's streamline project (proposal: the claude.ai page
+"Avalanche Vector Field Interface"; questions: Notion, Meeting Notes). First built as option C of
+the proposal, with a neutral 2D field format, a baseline builder for MPM and a test (commit
+cf09d698, PR #18). Then cut down on Manuel's decision: we hand over the raw MPM data, the rest is
+hers. Documented in `mpm-mls-doc/16-raw-grid-view.md`.
+
+- **What stays.** `MpmRawView` and `MpmSolverNode::raw_view()` (the grid velocity, column floors,
+  grid resolution, mass-to-kg factor, interpolation and generation counters, a layout version).
+  Solver changes: the node mass in `grid_velocity.w`; a second tile-flag bit (`WAS_ACTIVE`) so tiles
+  the flow has left are cleared once; a reset clears `grid_velocity`.
+- **What was removed again.** `VectorField.h` (`VectorField`, `FieldBuilder`, `VectorFieldSource`),
+  `vector_field.wgsl`, `mpm_vector_field.wgsl`, `MpmBaselineFieldBuilder`, `test_VectorField.cpp`,
+  the benchmark's `vectorField=1` stage. Reason: a baseline would be code and a contract for us to
+  own, and whether her project computes the field is still open (Notion question 1). While it
+  existed, the builder cost 0.35 ms per update at the preset size and 0.58 ms at 320^2 x 16.
+- **Verified.** Substep test: errors against the float64 reference unchanged to the digit; node
+  mass in `w` sums to 300 for 300 particles; after moving the flow 500 m it is still 300, 600 with
+  the clearing switched off (mutation); the previous shaders fail the check. Benchmark A/B against
+  `HEAD`, three runs at 131072 particles: 0.96-1.05x, centre-of-mass trace identical. The app ran the
+  avaHit map scenario for 48 s with no errors in the log (prefs and imgui.ini restored).
+- **Layout version.** `MPM_LAYOUT_VERSION` (MpmSolverNode.h) versions the layout of `struct Particle`,
+  `struct ColumnStats`, `grid_velocity` and `column_floor`; `MpmParticleView` and `MpmRawView`
+  carry it. The renderer's copy of the layout is guarded at compile time: `ParticleRenderNode.cpp`
+  `static_assert`s `AvalancheRenderer::SOLVER_LAYOUT_VERSION` against it (checked: bumping the version
+  to 2 fails the build there). Procedure in `04-data-layout.md`.
+- **Not verified.** A reader of the raw view in a running app (none exists); a solver grid resize
+  with a reader attached; the cost of the tile clearing on a long run-out (a 300-run benchmark was
+  started and stopped); other GPUs than the M5.
+
+---
+
+## 2026-11-08
+
+### 2. Documentation pass for outside readers
+
+Went through the living docs in `mpm-mls-doc/`. The audience is now other people who want to
+understand the project, not the author; the dated reports stay unchanged as historical records,
+and 10-benchmark-results stays generated.
+
+- **README:** new intro; a "What this project adds to weBIGeo" section (solver, simulation
+  driver, 3D rendering, switchable overlays, AvaFrame integration, panel and scenarios,
+  benchmark and test tooling); "Current state" (what works, verification, performance,
+  limitations) instead of "Known gaps"; an AI-assistance disclaimer (implemented and documented
+  with Claude, directed by the author; the author inspected the shader and C++ files manually).
+- **Audit reports** moved to `mpm-mls-doc/audit-report/` and listed at the end of the README;
+  relative links inside them and from 01/07 updated and checked to resolve.
+- **Stale content fixed:** 05's September performance figures replaced by the current benchmark
+  (old fit kept as a dated note: kernels now 4-8x faster); 07 reframed as a description,
+  rendering and the com1DFA comparison marked done, Cam Clay cost measured (~9 %); 01's
+  deviations table gains the sorted P2G, the Cam Clay Taylor series and the contact order; 02
+  lists the golden tests, the benchmark and the substep test; 09 marks display interpolation
+  done and G2P2G as the next candidate; 14 and avaframe/README no longer say entrainment is
+  unused; 15 gains the limitation that entrainment runs are not bit-reproducible (pool slots from
+  a global atomic).
+- **Verified:** `test_mpm.py` re-run, numbers reproduce (mass 150.00, min z 3.00, mean jp 0.7456).
+  Notes to self ("be honest in the report", "tested by Manuel") removed.
+- **Follow-up:** 09-performance-analysis rewritten for the current state (697 → 301 lines:
+  summary, kernel design, measurements, memory recomputed from the current buffer sizes,
+  playback, lifetime, method, improvements); Li 2021 runtime figures dropped (never checked
+  against the PDF); the base-code lifetime fix noted as unmerged (`fix/node-lifetime-registrations`).
+  README and 05 called 131 k particles "the preset": the graph preset is 65 536 at 320² × 12.
+  07's struck-through to-do list replaced by what is really not implemented; Build order removed.
+  Links into 09's old section numbers updated in eight docs and `results_to_markdown.py`.
+- **Follow-up 2:** history-first passages rewritten solution-first in 01, 03, 04, 05, 07, 13, 14.
+  08 rewritten as "Simulation domain: the terrain-following grid" (its §1 still described the
+  dense 128³ grid); the September measurements kept as the reason. 05's "3D renderer (next big
+  thing)" plan replaced by a pointer to 12. 06 left as the dated test record.
+
+### 1. Whole-kernel substep test
+
+The verification report's main limitation was that the transfer kernels were checked by
+inspection only: the golden tests (11-07) cover functions, not the kernels with their bindings.
+Added `bench/check_substep.mjs` (page `check_substep.html`), which runs the real sort, P2G,
+grid update and G2P kernels on the GPU from a known state of 300 particles on a planar slope
+and compares all particle fields with the float64 reference of `scripts/make_golden_substep.py`
+(mirrors the shaders including the fixed-point rounding). Two scenarios: free (1 and 3
+substeps) and contact (1 substep). `MpmBench` gained `setParticles`, `readParticles`,
+`prepareTerrain` and a terrain function; `headless_common.mjs` now holds what `run_headless.mjs`
+and the new checker share.
+
+- **Result (M5):** velocity within 3.3e-4 m/s, position 4.9e-4 m (float32 spacing at 2000-4000 m),
+  F within 1.6e-6, for all three materials. The shaders from before the sort give the same
+  errors to the digit.
+- **Sensitivity:** eight mutations are all caught: P2G stress factor 3.9 instead of 4
+  (Drucker-Prager only), G2P factor 3.9 instead of 4, x and y swapped in the P2G window flush,
+  gravity 1 % low, contact projected 1 mm too high, contact velocity not corrected, the sort
+  scatter dropping a bit of the index, Cam Clay q = 1.5 |s|.
+- **Found while building it:** a first version with contact in all three substeps failed for Cam
+  Clay alone, with a 2 m/s velocity error at the first substep. The cause was in the test input,
+  not the kernels: a particle ended within 1e-4 m of the surface, below float32 spacing, and took
+  the other branch of the contact decision. Contact flicker is structural (a particle on the
+  surface is pressed into it by gravity every substep), so contact is now a scenario of one
+  substep, and the generator rejects inputs with a surface margin below 4e-4 m.
+- **Also on SwiftShader** in 3 s. Not covered: domain walls, Voellmy, entrainment, curved terrain,
+  the mass carry, long runs.
+- The report (Notion) now describes the sorted P2G and cites this test for the transfer kernels;
+  section 4 was rewritten for `main` and the callouts of the formulas the test covers updated.
+
+## 2026-11-07
+
+### 1. GPU golden tests
+
+`unittests/webgpu_compute/test_MpmGolden.cpp` runs the real WGSL functions on the GPU and
+compares them with the Python ports: svd3, all three return mappings with their stress, both
+friction laws and the B-spline weights. 1,900 assertions over ~1,200 cases. The golden values
+come from `mpm-mls-doc/scripts/make_golden.py`. `MpmSolverSettingsUniform` is now public, so
+the test fills the real uniform. Results, tolerances and what is not covered:
+`06-verification.md` §4o.
+
+- **Agreement:** GPU and ports agree to 1e-7–4e-6 (float32 rounding), and every case takes the
+  same branch.
+- **First-run failures:** two were boundary cases in the test inputs, not bugs: the
+  Drucker–Prager apex, and a velocity exactly tangent to the terrain. The generator now keeps a
+  margin to every branch decision.
+- **One real float32 bug, fixed:** Cam Clay `sinh` (in p₀) and `asinh` (in the initial state)
+  cancel for a small argument. For Li Case V at 3 MPa (p₀/K = 1.2e-3), p₀ was off by 8.1e-5
+  relative and α₀ by 2.2e-5. Fixed by `ccc_sinh` / `ccc_asinh` with a Taylor series below 0.1;
+  now 1.7e-7 / 6e-8. The test compares p₀(α) directly, with arguments up to 3.
+- **Verified by mutation:** putting the old audit's q = 1.5‖s‖ into the Cam Clay shader makes
+  all three Cam Clay groups fail. Restoring it makes the suite pass again.
+- **Not done:** a one-particle substep through the whole kernels. `test_mpm.py` ports the older
+  dense-grid loop, so that needs a new reference first.
+
+
+### 2. Tile-sorted P2G (branch `p2g-tile-sort`)
+
+Analysis of taichi_mpm (Notion page "Faster P2G: tile-sorted particles and shared-memory
+accumulation"):
+- Its "real-time" demo is 2D with 1.5 k particles; its 3D runs take 17–288 s per frame on CPU.
+- Per million particles and step: Wang 2020 1.2 ms, Taichi GPU 3.9–5.5 ms, weBIGeo 8.8 ms on
+  an M5 with about a third of their memory bandwidth.
+
+Implemented the proposal:
+- A per-chunk counting sort of the particle **indices** by 4×4-column tile (`mpm_sort_*`).
+  The data lives after the tile flags in binding 10, so the layout stays at 8 storage buffers.
+- P2G sums each workgroup's home-tile window (6×6×16 nodes) in workgroup memory and writes
+  each node once.
+- The particle buffer keeps its order, because the renderer pairs particles by index.
+
+Measured on the M5 (`run_headless.mjs --chrome --baseline HEAD`; 09 §8.6): 1.73–2.16× less GPU
+time per run across materials and 65 k–1 M particles, P2G about 3× faster. The centre-of-mass
+trace is bit-identical to `main` in every configuration.
+
+- **G2P in sorted order:** tried and reverted. It is slower at 131 k and 1 M particles, because
+  scattered 128-byte particle access costs more than the grid locality saves.
+- **App batch check (avaKot):** without entrainment, the only differences are from the later
+  stop time; Fast pacing gives the branch different chunk sizes, so it reaches the rest
+  criterion 0.68 s later. Erosion is not reproducible on `main` itself: two runs gave peak
+  speeds of 117.0 and 104.5 m/s.
+- **Trap:** Playwright's headless shell has no GPU on macOS and silently runs SwiftShader.
+  Added `--chrome` to `run_headless.mjs`, which uses the installed Chrome (Metal).
+- **Trap:** zsh does not word-split `$cfg` (again); run benchmark loops under `bash -c`.
+
+## 2026-10-27
+
+### 1. Entrainment (branch `entrainment`)
+
+Asked by Manuel: plan and implement entrainment, a document like 12-rendering, a Notion
+summary; then a comparison with com1DFA with entrainment and against the old null benchmark,
+and a report on claude.ai. Decisions (asked): everywhere (sandbox, AvaFrame map scenarios,
+generic map scenarios with a cover slider), both com1DFA laws (plowing, erosion), validation on
+all five avalanches. Notion ticket "Entrainment: dormant snow cover picked up by the flow".
+
+**Built** (15-entrainment.md): AvaFrame's ENT shapefiles in the datasets (Python and C++,
+byte-identical); cover per grid column set in `mpm_prepare`; the grid update erodes it
+(plowing / erosion τ_b|u|/e_b) and turns eroded snow into pool particles at rest, written with
+negative mass so G2P only flips them and the next P2G adds them without momentum. Panel
+controls, mode per context (map erosion, sandbox off), export block.
+
+**Design change on the way:** the plan from the 12 Oct research was dormant cover particles
+woken in G2P (with tile stamps against stale grid velocities). Implemented and working in the
+sandbox, but the generic map cover needed 16 M particles, and it seeded nothing on the map
+because the preset's `seed_anywhere` made every sample count as release. Replaced by the
+per-column cover, as com1DFA does it; memory now scales with what is entrained.
+
+**Mistake on the way:** re-running `prepare_dataset.py --real` deletes each dataset folder,
+including the `mpm/` and `com4FlowPy/` run results. A backup taken just before restored them
+(and the full `index.json`). Now noted in avaframe/README.md.
+
+**Verified:** see 06 §4n and 15-entrainment.md. Off reproduces the 11 Oct AIMEC runouts
+exactly; erosion entrains 80–83 % of com1DFA 2.1's volume (Madlein 55 %); com1DFA's plowing
+over-entrains (its own TODO); mean runout error to com1DFA 149 m off, 119 m erosion. Map:
+Hintertux and Breite Ries entrain; web build compiles; unit tests pass. Report:
+https://claude.ai/artifact/3j7VDeZNRUf3mF3sE9TpNc
+
+### 2. Accuracy and performance: findings and ideas
+
+Asked by Manuel: ways to improve accuracy and performance (finer grid, many more particles,
+grid only where the avalanche goes, numerical precision, graphics tricks); a report.
+Experiment: com1DFA with the MPM's Coulomb μ 0.47 (`run_com1dfa.py --modes coulomb`). It flows
+at 48–57 m/s, the MPM at 97–130 m/s (1.9–2.6×), while the MPM's energy line gives μ_eff
+0.54–0.58: the bulk is braked, the excess is likely in the thin fringe that barely touches the
+friction nodes (hypothesis, test proposed). AIMEC's runout-statistics figure raised on Madlein vs
+com1DFA-Coulomb; `compare_aimec.py` now skips a failing figure. Report with the ranked ideas
+(corridor/dynamic sparse grid, anisotropic cells, particle-level friction, sorted/shared-memory
+P2G, subgroups, G2P2G, quantized particles, softer E, depth-averaged MPM):
+https://claude.ai/artifact/9fKVw5UDVUFMkSQxvdWaxh
+
+### 3. Entrainment on the map: drawing the cover
+
+Asked by Manuel: why no snow that will be picked up is visible. Cause: the solver keeps the
+cover as one number per grid column, not as particles, and fills pool particles at rest under
+the flow, so there was nothing to draw before pickup and nothing to tell apart after. Asked to
+do (1) draw the cover as a layer the flow erodes and (3) fix the interpolation of newly filled
+pool slots.
+
+**Built:** `MpmParticleView::column_stats` → `Frame::column_stats` → field pass binding 5
+(cover / dx², bilinear between columns; the surface takes the higher of flow and cover);
+drawn as `COVER_ALBEDO` where no flow or track is, setting `entrainment_cover` ("Entrainable
+snow", on). Shaders that interpolate draw a slot that was empty in the previous chunk at its
+current position (it was at the domain origin, altitude 0). The surface's terrain lookup is now
+Catmull-Rom: on bilinear terrain the wide, thin cover was lit in blocks of the height texture's
+texels.
+
+**Verified:** WGSL validator; release build; on the map, Madlein (avaMal), paused at 25 s, the
+cover is drawn on AvaFrame's entrainment area and ends at the track (shots with the cover on,
+off and in speed colours); Catmull-Rom removed the blocks. **Not verified:** the interpolation
+fix is not visible in accuracy playback (no interpolation); checked by reading only. GPU cost
+not measured.
+
+### 4. Paper references checked against the PDFs
+
+The MPM shader report (Notion) and its 15 sub-pages now cite section, equation, table and
+PDF page for every reference. Each one was checked against the text extracted from the PDFs
+in the iCloud folder `Tu/VisComp/avalacheSim/`. The report's Papers table lists every PDF in
+the folder, with its subfolder and use.
+
+Corrections that change content, not just precision:
+- **Hu 2018:** the force with ∂Ψ/∂F Fᵀ is §3.4 Eq. 18 (p. 146:7), not §4. §4 is the step
+  list. The article number is 146, not 150 (fixed in `refs.md`).
+- **Wolper 2019 q:** §6.1 writes q = √((6−d)/2)‖ŝ‖, which is √(3/2)‖s‖ in 3D, the same as
+  Gaume. The audits had dropped the square root and claimed a √1.5 rescaling of M. Fixed in
+  `01-theory.md` and `refs.md`; a dated correction note was added to both audit reports.
+- **Stomakhin collisions:** Stomakhin collides particle velocities *before* the position
+  update (§4.1 step 9). Our G2P resolves contact after advection and projects the position.
+  The shader page now names this as a deliberate deviation.
+- **Voellmy:** no PDF in the folder states the law. The com1DFA paper does not mention it.
+- **Li 2021 Fig. 5:** shows the elastic/plastic particle distributions. The plastic ratios
+  are compared in the text on p. 7.
+- **Stale ⚠️ notes removed:** doc items 1, 2, 4, 5 and 11 are already fixed in the code and docs.
+
+Verified: every number is from the extracted PDF text (pypdf). Not verified: the
+screenshots, which are still the user's step.
+
+### 5. Paper references in the WGSL shaders
+
+Each MPM shader now lists its papers in the header comment, and the code cites section,
+equation and PDF page at the line that implements them, using the numbers checked in
+request 1. Comments only: the shaders minus comments are identical, and tint validates all
+of them. Committed on `main`, because the docs and comments are needed there before
+entrainment can merge. `main` was then merged into `entrainment`. The script that inserts the
+comments also covers the entrainment-only code (`entrain_column()`, the cover in
+`mpm_prepare`, the particle pool), so the conflicts were resolved with its output on the
+entrainment shaders.
+
+## 2026-10-25
+
+### 1. Rendering doc: from plan to description
+
+Asked by Manuel: turn `12-rendering-plan.md` into `12-rendering.md`, describing what is
+implemented and where; the status with dates is irrelevant. Renamed with `git mv` and rewritten
+from the current code (`AvalancheRenderer.h`, the panel, `ParticleRenderNode`, `Window::paint`):
+scope, what the map shows, a file table, the frame order, solver → renderer data path (now with
+the real-time interpolation), solid particles, powder, flow surface, track and snow cover, panel
+controls with defaults, limits, rejected options. The step-by-step history is condensed into the
+"why" next to each part (elastic F → strain-rate ellipsoids, the replaced binning surface, the
+holes-over-bumps diagnosis). Links updated in README, 02, 03, 06 and the `AvalancheRenderer.h`
+comment; older log entries keep the old name.
+
+### 2. Guide: implementing another time-stepped simulation
+
+Asked by Manuel: a dedicated doc on how a simulation that is neither MPM nor avalanche specific
+uses the driver. New `docs/time_stepped_simulations.md` (next to the other engine/app docs, since
+it is generic): the frame flow, the two modes, the contract of every `TimeSteppedSimulation`
+method (notably: advance `simulated_time()` at submission, refuse `advance_frame()` under
+backpressure, always honour `end_run`), what a "run" means for the graph (every completed run
+re-runs the downstream chain), a commented sketch of a heat-equation node, wiring (no driver
+registration), interpolation, pitfalls (liveness token, run serial, in-flight cap) and testing.
+While writing the sketch, a first draft completed the run twice from a late callback of a closed
+real-time run; it now checks a per-run "per frame" flag, as `MpmSolverNode` does. Linked from
+`webgpu_app_dev.md` and from 13-simulation-driver.md "Adding another simulation".
+
+### 3. Orbit camera: zoom limits
+
+Reported by Manuel: zooming in too far, or out too far, leaves a black view he cannot get out of.
+Cause: with the sky under the cursor the G-buffer position readback is (0,0,0), so the depth
+tester returns the camera position as the operation centre; `OrbitInteraction::zoom` then
+normalised a zero vector and the camera position became NaN. Zooming in also approached the
+terrain with a fixed minimum step, so it could step through it, after which the cursor hits
+nothing again. Fix in `nucleus/camera/OrbitInteraction` (shared with upstream): no hit → a point
+along the ray at the last hit distance; `move_towards_centre()` clamps the distance to the centre
+to [10 near planes, 500,000 world units] (half the far clipping), letting a camera already
+outside that range only move back towards it; pinch uses it too. Three Catch2 sections in
+`unittests/nucleus/Camera.cpp` (flat-terrain fake depth tester: zoom in, zoom out, sky) pass.
+Not tried by hand in the app yet. `docs/camera_controls.md` updated.
+
+### 4. Web build tested in the browser
+
+Manuel tested the web build in the browser: the AvaFrame download, the release areas on the map,
+the 3D rendering and the real-time playback with interpolation all work. Recorded in 06, 12, 13, 14 and the README of mpm-mls-doc, the rendering report and the Notion pages; the ticket "AvaFrame release
+areas on the map" is set to Done (PR #13 merged 24.10.).
+
+## 2026-10-24
+
+### 1. Generic simulation driver: real time and accuracy playback (branch `simulation-driver`)
+
+Asked: replace the panel-driven stepping with a generic solution that fits other simulations
+(an interface, like the node graph), and a "cinema" mode that runs on frame time like a game
+engine, keeping today's accuracy pacing for the sandbox. Plan clarified first (Notion ticket
+"Generic simulation driver: real-time and accuracy clocks"): interface in `webgpu_compute`,
+app-level driver, fixed-step accumulator that falls behind rather than change `dt`, map real
+time / sandbox accuracy with a switch, 0.1–4x, no interpolation, Pacing as the budget.
+
+Built: `TimeSteppedSimulation` (interface, owns a `SimulationClock`), `SimulationClock`
+(accuracy = the old `apply_pacing`; real time = debt accumulator), `SimulationDriver` (ticked
+from `ImGuiManager::render()`, also with the GUI hidden), `MpmSolverNode` implements it,
+`AvalanchePanel` only controls the clock. Write-up: `mpm-mls-doc/13-simulation-driver.md`.
+
+**Three wrong turns, each found by measuring** (temporary per-second log harness, reverted):
+- Real-time runs of two chained chunks put both into one frame and none into the next:
+  **30 frozen frames per second** at 1x, i.e. 30 Hz motion. Fix: `Submission::PerFrame`,
+  one chunk per frame from the driver, an 8-frame run, the run done once its last chunk is
+  submitted (the readback map waits for the GPU anyway), so runs follow each other without a gap.
+- The integer chunk floor(6 ms / 1.7 ms) = 3 steps could not reach the 3.3 steps per frame of
+  1x: budget in fractional steps over the run.
+- Per-frame chunks measure 1.5–3 ms per step where accuracy chunks measure 0.8 ms on the same
+  flow (at 1x and 2x the GPU time per frame was the same ~9.5 ms: it looks like the GPU clocks
+  down under light load; not proven). Budgeting with the average fed back down to 0.5x; a best
+  cost that relaxed upward still decayed to 0.58x over 50 s. Final: the best cost since the
+  reset, with GPU backpressure (three chunks in flight → the frame's chunk is skipped) as the
+  real overload guard.
+
+**Verified:** unit tests (17 sections, fake simulation; removing the run cap fails them).
+On the M5, map Hintertux, Medium: 1x Smooth 0.98–1.01x throughout, 56–60 fps, 0 frozen
+frames; 4x Smooth steady 2.64x flagged behind, 60 fps; GUI hidden keeps it running. Accuracy
+unchanged: batch avaKot Stomakhin Coulomb at rest after 80.25 s vs 79.60 s in phase 6, same
+footprint and peak speed. Phase-2 commit builds on its own; web build compiles.
+**Not verified:** the web build in a browser; the playback controls were only seen in a
+screenshot, not clicked (Pause draining a run is unit-tested only).
+
+Also found by review: pausing mid-run would have left a PerFrame run unfinished forever
+(Step, Reset and graph runs queued behind it); the clock now drains it while paused.
+
+Test runs backed up and restored the prefs (`defaults delete` + `import`, since `import`
+alone keeps added keys) and `imgui.ini`; one test export in `avaKot/mpm` was deleted again.
+Mistake on the way: a zsh loop did not split `$cfg` (the same trap as before) and ran four
+tests with empty prefs; only scratchpad files were affected, rerun under `bash -c`.
+
+### 2. Interpolation for real-time playback (same branch, PR #12)
+
+Asked: "add interpolation". Clarified: real time only, an "Interpolate" checkbox on by default,
+same branch. Design (game-engine style, Fiedler's "Fix your timestep!"): the clock keeps a
+presentation time T; each frame runs just enough steps to be at or past T, in one chunk
+(`advance_frame()`); the renderer draws positions blended between the particles before and after
+that chunk (`set_interpolation()`). The pre-planned 8-frame runs went: the clock now decides each
+frame's steps, and only closes a run every 8 chunks. The solver copies its particle buffer before
+each real-time chunk (`m_previous_particles`); the three particle shaders blend the position.
+
+**Found while measuring, more important than the interpolation itself:** the map only repaints
+on request, and `ParticleRenderNode` requested it once per solver run. So the 3D view had
+updated once per run — every 8 frames in real time — and the "0 frozen frames" of entry 1 were
+only true for the simulated time, not for the picture. The harness now counts real repaints.
+Also the driver ticked in the GUI pass, after the paint, so a frame would have drawn the new
+chunk with the old interpolation. Fixed: `App::render()` ticks before the paint and repaints
+every frame while a simulation plays.
+
+**Verified:** 23 unit test sections (forcing the interpolation to 1 fails the two drawn-time
+ones). On the M5, map Hintertux: 1x Smooth 1.00x, 60 fps, 60 repaints/s, drawn time 16.67 ±
+0.3 ms per frame, no still frame (GUI hidden for 10 s included); 0.1x: the simulation stands
+still 41 frames per second, the picture in none (41 with interpolation off); 4x Smooth 2.67x
+steady, behind, 60 fps; accuracy unchanged in behaviour (45 fps, per-run updates). Each commit
+builds on its own; web build compiles. **Not verified:** the browser; the checkbox was not
+clicked (set through the prefs in the runs).
+
+Prefs note: the per-run backup already held the user's own newer prefs (they had used the app
+in between, e.g. `startup.scenario` 4); each run restored exactly those.
+
+### 3. AvaFrame release areas on the map (branch `avaframe-map-release`)
+
+Asked: give the map's real-time ("cinematic") AvaFrame scenarios the actual AvaFrame release
+areas, as in the sandbox; an approximation is fine since the coordinate systems differ; document
+it on a Notion page. Clarified: disc as fallback without the data, AvaFrame areas without the map's
+slope mask, AvaFrame's per-cell depth, a picker (only avaGar has several scenarios).
+
+Built: `load_sandbox_terrain()` (the sandbox's dataset loading, factored out);
+`AvaFrameReleaseNode` with `resample_release()` (region texel → world → inverse of the dataset's
+affine placement → nearest AvaFrame cell); a `ReleaseArea` socket type; the solver's optional
+"release area" input switches it to the sandbox's release grid mode on the map; the map graph
+preset gets the node; the panel configures it per scenario, shows which release is used, and
+offers the picker. Write-up: `mpm-mls-doc/14-avaframe-release-on-map.md` with a figure
+(`avaframe/tools/map_release_figure.py`).
+
+**Verified:** unit tests for the resampling. On the device, the five scenarios: volume on the map
+within 0.1 % of the dataset's; centroids within half a metre of the pyproj centroids the old discs
+were placed on (Madlein differs by design: its disc sat on the largest of three areas); all
+particles seeded, none outside the domain; disc fallback with an empty dataset folder.
+**Not verified:** the picker click; how much the map's terrain under the release differs from
+AvaFrame's DEM; the browser.
+
+A screenshot of the released particles did not help (from the framing distance they cannot be
+told from the snow cover); the figure is drawn from the datasets instead, which the volume and
+centroid checks tie to what the map releases.
+
+### 4. Crash: map mode, then the sandbox, then a dataset switch (PR #14)
+
+Reported by Manuel. Two crash reports (14:24, before the map-release work, and 15:04), both
+`EXC_BAD_ACCESS` in `TextureOverlay::draw` with different small addresses: a use-after-free, not a
+null. Cause: `OverlayRenderNode` linked its overlay by raw pointer when it ran; the graph runs its
+nodes as one chain in topological order (sandbox → solver → map overlay), so after a dataset
+switch the sandbox node had replaced its map texture while the overlay relinked only once the
+solver's run had finished, frames later. Fix: the overlay asks a callback for the texture every
+frame (`link_texture_source`, reading the node's input socket), and overlays without a texture
+are left out of the ping-pong chain (`can_draw`). Reproduced with a temporary harness (map,
+sandbox, three dataset switches): crashed on the first switch before, survives all three after, on
+main and on this branch. Own branch `fix-overlay-texture-link` from main, merged into this one.
+
+Mistake on the way: an edit script re-opened `TextureOverlay.cpp` for writing before reading it
+and emptied the file; the link error showed it, restored from git.
+
+## 2026-10-10
+
+### 1. Solver in metres instead of Web Mercator units (branch `mpm-metric-units`)
+
+Found while planning the AvaFrame comparison: `MpmSolverNode` took world units (Web Mercator,
+1/cos(latitude) too long horizontally) as metres, while heights are metres. **Measured** before
+changing anything, with a temporary probe comparing the slope the solver sees against the
+Mercator-corrected release mask (30–45°): 25.3–27.3° on all three scenarios, i.e. tan 37°/1.47.
+**Fix:** region size, domain position and release centre converted to metres with
+cos(latitude of the region centre); domain box converted back for the map; panel readout from
+the node's metric domain size. **Measured after:** 35.0–37.4°. Probe removed. Doc: 04 (coordinate
+conventions), 06 §4k, 01 §5, 05. **Consequence:** all earlier real-terrain results ran on
+flattened slopes; Dachstein now produces band-ceiling contacts on its cliffs. PR #6.
+
+### 2. AvaFrame comparison, phase 1: dataset preparation (branch `avaframe-comparison`)
+
+The plan (in Notion) compares the MPM solver with AvaFrame com1DFA on AvaFrame's own test
+cases. Phase 1 makes those cases usable: `mpm-mls-doc/avaframe/prepare_dataset.py` reads a
+pinned sparse clone of AvaFrame 2.1 (`extern/avaframe`, git-ignored). It writes, per dataset, to
+`extern/avaframe_sandbox/`:
+- the DEM;
+- the release thickness rasters;
+- the com1DFA benchmark peak rasters (pft/pfv/ppr);
+- the AIMEC path;
+- a preview PNG;
+- for real terrain, EPSG:3857 PNG overlays with `_aabb.txt` sidecars for the Overlays panel.
+
+It needs only numpy and pyproj: shapefile, dBASE, ASCII-grid and PNG I/O are hand-written.
+The tool's README has the dataset table and the conventions.
+
+**Decisions.**
+- **Release thickness is slope-normal**, so the volume is Σ t·A / cos(slope). Treating it as
+  vertical made avaKot 30 % light.
+- **References stay on com1DFA's own 5 m grid**, because it remeshes. They are not
+  resampled onto the DEM.
+- **Geolocate only if the DEM centre lies inside the CRS's area of use.** The synthetic
+  datasets ship the same Austria Lambert `.prj` with local coordinates, which would place
+  them off Liguria.
+- **GeoTIFF datasets are skipped** (avaAlr, avaFlowPy, avaMalRegional, scarpExample).
+
+**Verified:**
+- `--all` runs (23 datasets prepared, 4 skipped).
+- avaKot release volume is 21 681 m³ against com1DFA's logged 21 640 m³.
+- The avaKot preview matches AvaFrame's own plot of footprint and path.
+- The overlay sidecar matches the parser in `nucleus/utils/geopng_decoder.cpp`.
+- Real datasets land at 47.0–47.3° N, 10.3–11.7° E.
+
+**Not verified:** overlay alignment on the map in the app.
+
+**Not done:** phases 2–6 (sandbox terrain node, MPM peak rasters, display, AIMEC, model
+comparison).
+
+### 4. AvaFrame comparison, phase 2: the sandbox in the app
+
+PR #6 (`mpm-metric-units`) was merged into this branch first, because the sandbox needs the
+solver in metres. Then:
+- **`AvaFrameSandboxNode`** loads a prepared dataset: DEM, release, and the com1DFA footprint
+  resampled onto the DEM.
+- **`MpmSolverNode`** gets an optional `sandbox` input. When it is connected:
+  - the region is in metres;
+  - the domain is centred on release plus reference footprint;
+  - seeding uses rejection sampling by release depth per cell (`release_mode = 1`);
+  - the volume per particle is the exact release volume divided by the active particles.
+- The uniform grows from 176 to 192 B; the benchmark is updated to match.
+- The release binding is now `unfilterable-float`, so it accepts both RGBA8 and R32Float.
+- The **SandboxView** window and the panel's dataset picker, plus startup keys for running
+  straight into a dataset.
+
+**Decisions.**
+- **NODATA filled as a plateau, not walls.** A wall would exceed the terrain-following band's
+  step limit.
+- **The suggested domain decides the size and the cell size:** dx = max(DEM cell, size/512).
+- **No first-run notice for the sandbox preset.**
+
+**Verified:**
+- WGSL validator and the macOS build.
+- avaKot/relKot with Li V parameters runs end to end:
+  - all 65 536 particles seeded, release volume 21 681 m³;
+  - 85 s simulated in about 65 s;
+  - the centre of mass moves north as in AvaFrame's plot;
+  - screenshot of the 2D view checked.
+- Benchmark in the browser pane, this tree against HEAD: identical physics trace and GPU time
+  (the disc path is unchanged).
+- The map scenario runs without validation errors.
+
+**Not verified:**
+- The headless CDP benchmark script returned zeros on both trees. It is a harness problem,
+  because the browser pane works.
+- The web and iOS builds of the new files (no sandbox folder there by default).
+
+### 5. AvaFrame comparison, phase 3: peak rasters, stop rule, export
+
+- **Peaks per grid column** (`ColumnStats`, binding 11): depth from the column's mass, as for
+  Voellmy, and speed from the mean speed of the particles in the column.
+- **Stop rule** `at_rest()`: kinetic energy below 1 % of its peak, the benchmarks' "< 1.00
+  percent of PKE". The panel pauses there.
+- **Export** `write_sandbox_result`: pft (slope-normal), pfv and ppr (ρv²) on the DEM grid,
+  with the DEM header, in `<dataset>/mpm/<time>_<release>/`, plus params.json.
+
+**Two problems found and fixed on the way:**
+1. **Grid velocity is the wrong speed.** Using the node momentum, or the updated grid velocity,
+   gave up to 234 m/s at the flow's edge, where columns hold almost no mass and the MLS-MPM
+   stress impulse dominates. The fastest particle was 101 m/s. Gating by peak depth did not
+   help, because depth and speed peaks happen at different times. Now particle-based.
+2. **Two atomics in P2G changed the physics trace.** They shifted it by 2 mm after 10 s,
+   deterministically. Bisected in the benchmark: without the atomics the trace is
+   bit-identical, and with them it differs even when they add a constant. That is the
+   compiler's float arrangement, not data flow. They moved to a separate `mpm_column_stats`
+   pass that runs only in the sandbox; the trace is bit-identical again and the GPU time
+   unchanged.
+
+**Verified:**
+- avaKot: at rest after 95 s. Max pft 13.4 m (com1DFA 5.9 m), max pfv 104.5 m/s (39.7). The
+  speed is right for Coulomb friction without drag.
+- avaKot with pft > 0.1 m: 97 % of the reference cells covered, 64 % of the MPM cells inside
+  the reference.
+- avaGar: at rest after 116 s; 88 % covered, 79 % inside. The 35 m maximum sits at the gully
+  constriction where com1DFA also peaks (12.3 m).
+- Export headers equal the DEM's.
+- Benchmark bit-identical to phase 2.
+
+### 6. AvaFrame comparison, phase 4: display
+
+- **2D view layers:** live particles; MPM peak pft, pfv and ppr; com1DFA pft, pfv and ppr.
+  One colour scale for MPM and com1DFA, a legend, values under 0.1 m faint, and a hover table
+  with MPM against com1DFA at the cell.
+- **The sandbox node now loads all three reference rasters.**
+- **Map overlay for real datasets.** An affine fit to the DEM corners, resampled into a
+  world-aligned texture, through an `OverlayRenderNode`. That node gets a `trim_stitch_edge`
+  switch, because its trim is for stitched tiles only. The texture is never null, since
+  `TextureOverlay::render` asserts on it; synthetic datasets get 1x1 transparent.
+- The camera flies to real datasets, wired to the controller like the search panel.
+- The view's layer and visibility are stored per user.
+
+**Verified:**
+- Screenshot of the 2D peak layer with legend and hover table.
+- Screenshot of the overlay on the map at the Lechtal: the fan sits at the slope foot.
+- Affine placement against pyproj's exact transformation over each real DEM: ≤ 0.49 m,
+  mean 0.1–0.2 m.
+
+**Process note:**
+- Screenshots now capture only the app window, matched by process ID. A full-screen capture had
+  caught another window, and the first by-name match hit the user's own webgpu_app instance.
+- Test runs now back up and restore the user's app preferences and imgui.ini. They had
+  overwritten startup preset, location and pacing; those were restored by hand.
+
+### 7. AvaFrame comparison, phase 5: AIMEC rating and batch mode
+
+- AvaFrame 2.1 installed in `.venv-avaframe`. It needs Python < 3.14 and Homebrew has only
+  3.14, so the venv uses the system Python 3.9.6; nothing installed system-wide.
+- `compare_aimec.py` builds one AvaFrame avalanche directory per run: dataset inputs, the
+  benchmark as module com1DFA, the MPM as module mpm. It runs AvaFrame's module comparison with
+  the benchmark's own AIMEC configuration, in two threshold variants (ppr > 1 kPa,
+  pft > 0.1 m), and writes `aimec.json`.
+- Batch mode via `WEBIGEO_SANDBOX_BATCH`. Each run is exported with its label; the app writes a
+  results file and quits without touching the preferences (checked by comparing the plist).
+  `params.json` gains wall time and GPU time.
+
+**Pitfall caught:** AIMEC's `deltaSXY` is each result's own length along the path, not the runout
+difference. The first version reported 1767 m "difference". It is now sRunout(MPM) −
+sRunout(com1DFA), and the area indicators are labelled as runout-area only.
+
+**Verified:**
+- AIMEC runs on avaKot. Its comparison plot shows MPM ⊇ reference with lateral spread.
+- The batch reproduces the manual run exactly.
+- Voellmy (com1DFA's mu 0.155, xi 4000) runs further than Coulomb on avaKot: +291 m against
+  +198 m (ppr).
+
+### 8. AvaFrame comparison, phase 6: models compared
+
+- **com4FlowPy** through AvaFrame (`run_com4flowpy.py`).
+- **weBIGeo trajectory model** in the sandbox: a new preset, a release mask from the sandbox node,
+  `export_trajectories`, and the batch `"model": "trajectories"`.
+- **35-run batch** (`batch_phase6.json`). `summarise.py` runs AIMEC and writes the tables, and
+  `11-avaframe-comparison.md` holds the write-up.
+
+**Two measurement problems found and fixed before reporting:**
+1. **Runs cut off by the MPM box.** Different models ended at exactly the same runout per
+   dataset. The suggested domain (com1DFA footprint + 15 %) stopped them. Rerun on the whole DEM;
+   runs now record their wall contacts, which are 0–0.1 %.
+2. **Runs reaching the end of the AIMEC path.** A remaining identical value turned out to be the
+   end of AvaFrame's path. compare_aimec records the path length and marks such runouts "≥"
+   (lower bound).
+
+**Result** (pft > 0.1 m, five avalanches):
+- **Cam Clay with Li V parameters and Coulomb is closest.** Mean |Δrunout| 135 m, |Δangle| 1.5°.
+- **Every Coulomb variant except Stomakhin is about 2–2.5× too fast.**
+- **Voellmy with com1DFA's μ 0.155 / ξ 4000 runs too far for every material.** Open: the flow
+  depth the drag uses.
+- **Stomakhin's film snow stops early on the long avalanches.**
+- **The trajectory model is good where com1DFA's angle is near its α of 25°** and overshoots
+  elsewhere.
+- **com4FlowPy, on all five after the PR (11–146 min each):** mean 186 m and 2.5°. It sits
+  between the trajectory model and the best MPM variant.
+
+### 9. AvaFrame comparison: robustness runs, screenshots, detailed report (2026-10-11)
+
+- **65 MPM runs** (`batch_full.json`): materials × friction, Li I–IV, and a μ sweep for Li V.
+- **Screenshots of every run.** The batch has screenshot phases; `tools/run_batch_shots.sh`
+  captures by process id. Each real dataset is framed on the map by an explicit camera
+  (`frame_on_map`), because the search fly-to hid north-facing gullies.
+- **Report.** `report.py` builds an HTML report with 205 images, published as a private claude.ai
+  artifact.
+
+**A reproducibility bug was found and fixed:** dt was only ever lowered, so a batch run inherited
+the previous run's dt. A test run of Li V on avaKot gave 112 m/s against 100 m/s inside the batch.
+Each batch run now sets 0.8 × CFL for its own grid, and all MPM runs were redone.
+
+**Result:**
+- **Li I cold dense with Coulomb μ 0.47 fits best:** 103 m mean runout difference, 1.4°.
+- **Li V:** 140 m at μ 0.49, 111 m at μ 0.47.
+- **The cohesive Li II–IV stop short.**
+- **One μ cannot fit all five avalanches.** The steeper ones fit at 0.55, the flattest at 0.40.
+  That points to the friction law.
+- **First draft corrected:** it called that pattern a size effect, but avaHit (268 000 m³) fits
+  at 0.55. The doc now relates it to com1DFA's travel angle instead.
+
+### 13. Rendering research and plan, new worktree branch (2026-10-18)
+
+**Request:** start a worktree branch for the rendering ("Partikelsystemrendering, potentiell
+aggregierte Partikel"), research MPM and particle rendering, report with options, link in
+Notion.
+
+**Done:**
+- Worktree `.claude/worktrees/mpm-rendering` on branch `worktree-mpm-rendering`, from main
+  (`836dbcec`).
+- Report [Avalanche Particle Rendering](https://claude.ai/artifact/PWiuxTHUn9LvobGEQpksXj),
+  linked on the Notion rendering page and the overview.
+- Plan in `mpm-mls-doc/12-rendering-plan.md`.
+
+**Decision proposed:**
+- G-buffer geometry, so the avalanche is lit like the terrain.
+- Sphere impostors, then ellipsoids from the deformation gradient F (PhysGaussian's covariance
+  idea).
+- A draped flow surface aggregated per grid column (as Vicari et al. 2025 do for GIS).
+- Transparent powder later.
+- Not chosen: marching cubes (grid too coarse) and screen-space triangulation.
+
+**Sources:** some were read through search summaries only (the WebGPU-Ocean write-up blocked
+direct access); the report says which.
+
+**Implemented the same day: steps 1–2 (plumbing, sphere impostors).** The user asked to start
+and allowed edits to existing files. Details are in `mpm-mls-doc/12-rendering-plan.md`
+("Status").
+
+- **Solver:** `MpmParticleView` (a "particle view" output).
+- **App:** a `ParticleRenderNode`.
+- **Engine:** `AvalancheRenderer` and `render_avalanche.wgsl`, drawn in the G-buffer pass.
+- **Panel:** the "3D particles" controls.
+- **Validator:** `validate_wgsl.py` extended to engine shaders.
+
+**Worktree build:** `extern` is symlinked to the main checkout's (prebuilt Dawn, sources that
+include `extern/...`). Do not commit the symlink.
+
+**Verified:**
+- tint validates all shaders.
+- The macOS debug build compiles.
+- A sandbox batch run on avaKot (25 s) shows the lit particles at the front on the map, with
+  no WebGPU errors.
+- Prefs and `imgui.ini` were restored, and the test run folder was deleted.
+
+**Not verified:** the web build, a close-up.
+
+**Map mode is the target** (user, same day). The node was removed from the sandbox preset.
+
+**Map-mode verification:** Hintertux at 132 s, lit particle deposit and release. It used a
+temporary test build without the first-run notice; the preset was restored and rebuilt.
+
+**Step 3, strain-rate ellipsoids, done the same day.**
+- **The plan's premise was wrong:** the solver stores only the elastic F, about 1 % for snow, so
+  F-ellipsoids would look like spheres. The user chose the strain-rate variant (from C).
+- **Added:** a "Look at the flow" camera button.
+- **Verified:** Hintertux at 77 s shows stretched moving particles, through a temporary
+  auto-framing test build that was reverted.
+
+**Step 4, flow surface, done the same day.**
+- **Design:** bin → depth (solver terrain) → draped grid mesh with 3×3 smoothing and a 5 cm
+  contour.
+- **First attempt:** used the lowest particle as "ground"; it cut into slopes and looked blocky.
+  Replaced by the depth pass.
+- **Verified:** Hintertux at 74 s, via a temporary test build that was reverted.
+- **Open:** isolated small patches.
+
+**Fixes after step 4 (user):**
+- **Patches:** a 3×3 neighbourhood count of at least 8 is needed for a column to join the
+  surface.
+- **Overlay:** the 2D density overlay is hidden while the 3D particles are on, through a new
+  `Overlay::enabled`. The ping-pong chain uses only the enabled overlays.
+- **Verified:** with the temporary test build, reverted afterwards.
+
+**Approach that failed:** posting a click to the app's process (`CGEvent.postToPid`) does not
+reach SDL in the background. I did not move the user's real mouse.
+
+**Detail particles (2026-10-23, branch `mpm-rendering`, uncommitted).** The user reported a
+flickering, aliased flow surface and particles that look out of place because there are too
+few.
+- **Literature:** Stomakhin 2013 never shows particles; it rasterises them with the B-spline
+  kernels and path-traces a volume (0.3–7.2 M particles). Hu 2018 describes no rendering.
+- **The user chose both fixes:** render-only child particles first, then a mass-splat flow
+  surface.
+- **Children:** K per particle (1 / 8 / 27, default 8). Offsets are hash-stable, the radius is
+  scaled by K^(-1/3), and the children are scattered within 2 parent radii. They fade back
+  into the parent below about 3 px. Details are in `12-rendering-plan.md`, step 5.
+- **Two layouts were rejected after an A/B screenshot.**
+  - The volume-equivalent ball (0.62 spacing) made the clusters smaller than single particles.
+  - Packing the children into the parent's own sphere made them read as clods.
+- **Verified** with a temporary test build: paused at 40 s, camera at 150 m, the same frame
+  rendered with 8 and with 1.
+- **Test trap:** the app redraws only on change. Switching a setting from code while paused
+  needs a camera nudge to show up; the UI combo triggers the redraw itself.
+- **Test runs** set `startup.autoplay` temporarily, inside the prefs backup and restore.
+- **Temporary test patches** were reverted from the pre-patch copies and the build was
+  re-run.
+
+**Mass-splat flow surface (same day, uncommitted).** It replaces the per-column binning. Details
+are in `12-rendering-plan.md`, step 6.
+- **Splat:** a B-spline splat at the solver's dx onto a 3× finer render grid (shaders renamed
+  bin → splat, depth → field).
+- **Depth:** volume / area decides where the blanket is drawn.
+- **Height:** 2 × the mean particle height + radius, tapered at the edge.
+- **First attempt:** the volume depth alone. The blanket sat at release density under a looser
+  moving flow, and the particles speckled through it everywhere. Hence the height term.
+- **Verified:** the paused A/B at 3× vs 1× (smooth vs faceted outline) and a burst during
+  playback (no popping).
+- **Open:** GPU time not measured; the web build is not tested.
+
+**Gaps over bumps: diagnosis, then track and snow cover (same day, uncommitted).** Details are
+in `12-rendering-plan.md`, step 7.
+- **Diagnosis:** the same paused frame, with and without the airborne cut-off and with a
+  one-particle threshold. The holes stayed, so they are real: no particles within 12 m. They are
+  not a rendering threshold.
+- **B, track:** a persistent peak depth per render node, cleared on solver reset (new
+  `MpmParticleView::reset_count`). It draws a 0.3 m duller layer where the flow has been.
+- **A, snow cover:** `ParticleRenderNode` owns a pre-shading (lit) `ScreenSpaceSnowOverlay`.
+  The avalanche writes a marker into the G-buffer overlay slot, which the snow overlay skips.
+- **Test trap 1:** setting the same camera again does not redraw. Nudge the distance (800,
+  800.5, 801 m) when switching settings while paused.
+- **Test trap 2:** log the stage switches (`qWarning`) and match them to the capture
+  timestamps. The time to reach a given simulated time varies by several seconds between
+  runs.
+- **Validator:** now also checks `overlays/screen_space_snow`; temporary files for nested
+  names are flattened.
+- **Requested by the user:** future rendering options (screen-space fluid rendering and others)
+  documented in Notion.
+
+**Powder particles (same day, uncommitted).** The user's idea: particles rendered like gas, large,
+dense in the middle and sparse outside, as a guide over the surface. Mid-turn the user added: a
+noise texture shifted per particle. Details are in `12-rendering-plan.md`, step 8.
+- **Shape:** a third particle shape, `Shape::Powder`.
+- **Pass:** transparent, after compose, on the track-line pattern. No sort is needed for
+  same-coloured premultiplied "over" blending.
+- **Soft intersection** via the G-buffer depth.
+- **Noise:** procedural per-particle value noise instead of a texture asset (same effect, nothing
+  to load).
+- **Verified** on one paused frame, A/B against the ellipsoids. GPU cost not measured.
+
+**Powder default 8× spacing (user), committed with the powder particles. Snow cover thinning
+with altitude (same day, uncommitted).** The user asked for less snow lower down, then
+mid-turn: "possibly also just more sparse with a noise texture".
+- **Snow line:** the avalanche's snow cover fits it to the solver's terrain scan: full above
+  55 % of the relief, none at 15 % below the lowest point.
+- **Patches:** a new `patches` setting on the screen-space snow overlay turns the falloff into a
+  covered share drawn as world-space noise patches, instead of translucency.
+- **Verified:** an overview and a close-up of Hintertux.
+
+**Powder is now the default particle shape** (user). `Settings::shape` = Powder; the map preset
+sets no shape, so it applies there.
+
+**Docs brought up to date, towards main (same day).** The other session's docs fixes (PR #10,
+branch `claude/dreamy-sagan-1uw3da`) were merged into `mpm-rendering`.
+- `README` (doc table, pipeline, status), `02-files-and-api` (rendering files, modified engine
+  files, the `particle view` output, panel 3D controls), `03-shaders` (rendering shaders),
+  `06-verification` §5b (rendering checks; §5 now points at the AvaFrame comparison),
+  `12-rendering-plan` status.
+- Merging PR #10 into main from here was refused by the permission check (merge without
+  review). Left for the user.
+
+### 12. Entrainment research: a snow cover made of particles (2026-10-12)
+
+**Request:** assess the idea of seeding particles along the whole path, held by friction and
+picked up by the flow. First from the implemented papers, then for feasibility in our sim.
+Write the report in Notion.
+
+**Done:** Notion page "Entrainment with a particle snow cover — research and feasibility
+(12.10.2026)", under Avalanche Sim, and a short pointer in `07-constitutive-models.md` §7.
+
+**Sources read in full or in large parts** (PDFs via a scratch pypdf venv):
+- Gaume et al., ISSW 2024 O2.5;
+- Kyburz et al. 2024 (Salezer);
+- Li et al. 2024 (Communications Earth & Environment);
+- Li et al. 2020 (The Cryosphere), via the web page;
+- the com1DFA entrainment theory page.
+
+Li et al. 2022 is known only from its abstract and the ISSW summary. Cicoira et al. 2022 is
+cited, not read.
+
+**Conclusions:**
+- **The idea is the state of the art,** but it needs a cover at least 1–2 cells thick. Our
+  cells are 5–12.5 m, as tall as they are wide.
+- **Why it fails literally here:**
+  - Coulomb μ 0.47 holds a cover only below about 25°.
+  - The cover and the flow share one node layer and the friction band.
+- **Feasible: dormant cover particles** (mass < 0), woken in G2P, which behaves like
+  com1DFA's plowing mode.
+- **Cost:** with the AvaFrame ENT areas at 0.3 m, the cover adds 10–82 % particles
+  (+6–54 k). A uniform cover over the whole DEM needs 0.3–3.1 M particles.
+
+**Nothing implemented.**
+
+### 11. prepare_dataset.py ported to C++, behind a download button (2026-10-11)
+
+**Request:** port the preparation script to C++, trigger it from a button, and show a popup
+saying the data is external, may disappear, and takes a while.
+
+**What was built:**
+- **`apps/webgpu_app/avalanche/AvaFrameData.{h,cpp}`.** It covers the five real datasets.
+  - It downloads 62 files (about 40 MB) from raw.githubusercontent.com, pinned to the 2.1
+    commit, with a hardcoded manifest.
+  - It parses the ESRI grids, shapefiles and dbf tables, rasterises the release polygons,
+    projects EPSG:31287 to WGS 84, and writes the same files as the script.
+  - It merges its entries into `index.json` and deletes nothing.
+  - Not ported: the preview and overlay PNGs, which nothing reads, and the synthetic datasets.
+- **Panel.** "Download AvaFrame data..." in the sandbox section opens a modal: external data
+  that AvaFrame may move or remove, about 40 MB, takes a while, where it is saved, data sources.
+  While it runs, the panel shows a progress bar, the status and a cancel button. When it
+  finishes, the panel lists the datasets again and reloads the selected one.
+- **Default sandbox root without a source tree** (web, iOS): the app data folder; on the web
+  that is browser memory.
+
+**Decisions:**
+- **Number parsing and formatting** go through Qt (`QByteArrayView::toDouble`,
+  `QByteArray::number`), because Qt sets the C locale from the environment and
+  `strtod`/`printf` would then use a German decimal comma. Floating `std::from_chars` is
+  unavailable for this macOS target.
+- **Exact ties are rounded to even,** like Python's `%.3f`. Without that, 56–192 DEM cells per
+  dataset came out 1 mm different.
+- **The projection is written out** instead of using PROJ: inverse LCC on Bessel 1841, then
+  "MGI to WGS 84 (8)", a 7-parameter Helmert in coordinate-frame convention. That is the
+  transformation pyproj picked for the script.
+- **Threads.** Preparation runs on `QThreadPool` natively. The web build runs it queued on the
+  main thread. Results carry a run counter, so a cancelled run's result is dropped.
+
+**Verified:**
+- **Output against the script.** A scratch harness built `AvaFrameData.cpp` alone and ran the
+  real download into a scratch folder, in 1.2 s. Compared with `prepare_dataset.py`'s output:
+  every `.asc` is byte-identical, and every JSON file has the same content.
+- **Projection against pyproj:** at most 0.05 mm apart across Austria.
+- **Builds.** The macOS debug and wasm release builds compile, with no warnings from the new
+  code.
+- **Web fetch.** In the served wasm page (cross-origin isolated, COEP `require-corp`), both
+  fetch and XHR to the pinned raw URLs return 200.
+
+**Verified by the user:** the panel flow at run time works (popup, download, reload). I could
+not drive it myself: the browser pane was hidden, so the page ran at one frame per second.
+
+Mistake on the way: the harness took a quoted coordinate pair as an output folder and twice
+wrote stray folders into the repository root. Both were removed; the harness now requires
+`--out`.
+
+### 10. Where the AvaFrame test data comes from, before redistributing it in the web build (2026-10-11)
+
+The user decided to bundle the five real avalanches with the web build rather than load them
+from AvaFrame's repository at run time. They asked first where the data originally comes from.
+
+- **Terrain (DEM).** It is Land Tirol's "Digitales Geländemodell Tirol" (5 m) from Open Data Austria.
+  The dataset's licence on data.gv.at is **CC BY 4.0** on every distribution. Verified through the
+  hub API, record `0454f5f3-1d8c-464e-847d-541901eb021a`. The required attribution is
+  "Datenquelle: Land Tirol - data.tirol.gv.at".
+- **Release areas and thicknesses.** These came from the Austrian Torrent and Avalanche Service
+  (WLV, die-wildbach.at), through FZGL Fachbereich Lawinen, in November 2020. The dbf comments
+  ("Gutachterlich auf Basis Ereignis …") show they are expert assessments from hazard zoning.
+  AvaFrame's dataSources page says the data was "kindly provided" and names **no licence**.
+  No open-data listing for it was found.
+- **AvaFrame.** The repository is EUPL-1.2 as a whole, with one `LICENSE.txt` and no separate
+  data licence. `MANIFEST.in` prunes `avaframe/data`, so the PyPI package does not contain the
+  data; only the Git repository does.
+- **com1DFA reference rasters.** We generate these ourselves with AvaFrame code from the
+  inputs above, so they are derived from both sources.
+
+**Open:** whether the WLV release data may be redistributed outside AvaFrame. It is
+distributed publicly in AvaFrame's EUPL repository, but nothing states the WLV's terms.
+
+**Decision:** do not redistribute. The sandbox stays native-only, and the reason is written in the
+meeting notes of 13.10. and in `mpm-mls-doc/11-avaframe-comparison.md` §4.
+
+### 3. iOS build (PR #5, merged) — log entry added after the fact
+
+webgpu_app runs on an iPhone 17 Pro Max. The build uses:
+- Qt 6.11.1 iOS through aqt;
+- Dawn built from source for Metal, with a BC-format patch in `UtilsMetal.mm`;
+- static SDL2;
+- the Xcode generator.
+
+The fixes needed on the device were:
+- a UIScene manifest;
+- `SDL_Metal_CreateView` for rotation;
+- a smaller cloud atlas against the jetsam memory kill;
+- a repaint after resize, so the map is not black after a screenshot;
+- safe-area insets;
+- a UI scale of 0.75.
+
+Documented in `docs/webgpu_app_ios.md`.
+
+**Open:**
+- 3× resolution;
+- pinch zoom;
+- whether the top menu is reachable with the safe-area fix (not confirmed on the device);
+- replacing the temporary `TEMP-IOS-DIAG` log.
+
+## 2026-10-03
+
+### 1. Issue #3 audit, re-checked with Klár 2016 and Wolper 2019
+
+Manuel added both PDFs. Klár confirmed the Drucker–Prager code (§7.1 Eq. 27–28; Klár's flow
+is itself non-associative) and showed the cited section numbers (§5.3/§5.4) are wrong.
+Wolper showed the fixed-p Cam Clay return is NACC for Cases 1–2 but **omits §6.2.3**, the
+shear hardening — so shear never softened. Final and Opus audit reports updated, pushed to
+main (`f63e91e8`).
+
+### 2. PR addressing the final report (branch `audit-fixes`)
+
+**Done:** H1 (Wolper §6.2.3 in Case 3), M1 (plastic ratio per substep via
+`PlasticReturn.yielded`), M2 (energy-line path = mass-averaged particle path, summed in G2P,
+cumulative since reset), M3 (Voellmy local flow depth; real particle volume from a Monte
+Carlo estimate of the seeded area in `mpm_seed`), M4 (attribution), M5 (box-contact
+counters + sidebar warning), H2 (preset names/notes), L3, L5 (`max_stable_dt()` on P-wave
+speed, enforced every run), D4, guard/deviation table in 01-theory. G2P diagnostics reduced
+in workgroup memory. Bench: `SimState` 72 B, new `ccc_slab` material.
+
+**Decisions.** §6.2.3 rather than the associative return: closed form, and it makes the code
+the model it cites; associative stays a follow-up. Box counter uses stencil contact, not
+clamps: a 640 m test box showed 0 clamps while the flow piled against the wall (the grid
+wall nodes stop it first). ξ not rescaled with Δx: Li gives no rule.
+
+**Verified:** all offline scripts; tint; native build; app runs on M5 for Li V, Li III,
+Stomakhin, DP, Voellmy, partial-cover seeding and a small box (06 §4j). Headless-Chrome A/B
+vs main: no measurable cost; Li V trace unchanged, Li III mean speed 19.4 → 18.1 m/s.
+**Not verified:** web (wasm) build locally — CI builds it; behaviour on non-Apple GPUs.
+**Not done:** associative Cam Clay return, Klár φ hardening, convergence study at two Δx,
+GPU golden readbacks vs the Python ports, the DOI in issue #3's text.
+
 ## 2026-09-13
 
 ### 1. Proposal v3.0 gap analysis — constitutive & friction models
@@ -376,6 +1370,23 @@ tan⁻¹ 0.47 ≈ 25°) — it was not the wall.
 Docs: 02, 03 (prepare, grid update, stencil), 04 (band section, buffer sizes), 05
 (settings table, failure modes, cost), 06 (§4i), 08 (marked implemented), README.
 Committed by the user as `f02ad59a` "Extend terrain".
+
+## 2026-09-28
+
+### 1. "fix this" — validation errors from the timestamp resolve
+
+Console full of `The destination buffer [mpm timestamp resolve] offset (16) is not a
+multiple of 256` followed by `[Invalid CommandBuffer ...] is invalid due to a previous
+error`. Not cosmetic: the rejected command buffer is the one carrying that chunk's P2G /
+grid / G2P dispatches, so **every second chunk was dropped** — half speed, no GPU timing,
+and the adaptive pacing running blind.
+
+Cause: `ResolveQuerySet`'s destination offset must be a multiple of 256
+(`QUERY_RESOLVE_BUFFER_ALIGNMENT`); the two timestamp slots were packed at their natural
+16 B stride, so slot 0 was fine and slot 1 was not. Fix: `TIMESTAMP_SLOT_STRIDE_BYTES =
+256`, resolve buffer sized `TIMESTAMP_SLOTS × 256 B`, offset `slot × 256`. Verified on
+device: 0 validation errors over a 60 s run, 614 timestamp samples arriving,
+`gpu_ms_per_substep` 0.55 → 1.7 as the flow spreads. Docs: 06 (bug 9), 09 (§9.2).
 
 ## 2026-09-14
 

@@ -1,7 +1,16 @@
 # Verification
 
-What was actually checked, how, and what wasn't. Keep the distinction — it matters for the
-report, where "verified" and "compiles" are very different claims.
+What was checked, how, and what was not. "Verified" here means a test or measurement with a
+stated result; where something was only inspected or only compiles, the section says so.
+
+The verification has four layers, from the formulas to the running app:
+
+| Layer | What it shows | Where |
+|---|---|---|
+| Formulas against the papers | every formula of the shaders matches its source, deviations stated | the separate shader verification report, "Verification of the MLS-MPM snow solver shaders" |
+| Python ports of the shader functions | the formulas have the properties the papers state (yield surfaces, closed-form slope mechanics, energy line) | §2–§4i, `scripts/` |
+| GPU golden tests and the whole-kernel substep test | the WGSL on the GPU computes what the ports compute, the functions alone and the kernels together | §4o, §4p |
+| Runs on the device and on real terrain | the app does what the parts promise: diagnostics, playback, AvaFrame comparison | §4f–§4n, §5 |
 
 ## 1. Shader validation — `tint`
 
@@ -135,13 +144,16 @@ conserved exactly in both; nothing below the floor.
 
 ## 4e. Cohesive Cam Clay — return mapping, hardening law, Li 2021 parameters
 
-`scripts/test_material_ccc.py` ports `mpm_material_ccc.wgsl` verbatim. Twelve checks:
+`scripts/test_material_ccc.py` ports `mpm_material_ccc.wgsl` verbatim. Fifteen checks:
 
 | Check | Result |
 |---|---|
 | `p₀(initial α) == p₀ⁱⁿⁱ` | exact (α₀ = −19.28 at Case V's ξ = 0.002) |
 | Inside ellipse | elastic, unchanged |
-| **Shear (Case 3)** | projected onto the ellipse, `\|y\| ≈ 7e-8` on a 1e7 scale, **at the same p**, no hardening |
+| **Shear (Case 3)** | projected onto the ellipse, `\|y\| ≈ 7e-8` on a 1e7 scale, **at the same p** |
+| **Shear hardening (Wolper §6.2.3, 2026-10-03)** | Δα equals `(p× − p_tr)/K` with `p×` found independently by bisection along the centre–trial line, to 1e-9 |
+| Shear on the tensile / compressive side of the centre | softens (p₀ 3000 → 2998.1) / hardens (3000 → 3002.2) |
+| Repeated tensile-side shear, ξ = 1 | p₀ 3000 → 0: shear alone can now fracture the material |
 | **Compressive cap (Case 1)** | returns to `(p₀, 0)` exactly; α down, p₀ 3000 → 3012 |
 | **Tensile tip (Case 2)** | returns to `(−βp₀, 0)` exactly; α up, p₀ 3000 → 2997.6 |
 | 500 random gradients | never outside the surface they were projected onto |
@@ -243,14 +255,299 @@ Two checks that the band grid is a memory layout, not a physics change:
   different domain origin (particles fall on different sub-cell positions). Run time
   116 → 100 ms for 6× the area.
 
+## 4j. Audit fixes — on the device, 2026-10-03
+
+The issue #3 fixes ([07-constitutive-models.md](07-constitutive-models.md) §2h) change what
+the readback reports, so they were checked in the app the same way as §4f: autostart with a
+preset, an env-guarded log line per tenth readback, reverted afterwards. Breite Ries unless
+noted, M5, native Metal.
+
+| Run | Result |
+|---|---|
+| Li V (CCC, p₀ 3 kPa), 90 s wall | stable; plastic ratio 100 % from 0.17 s (the slab's 2.9 kPa weight is ≈ p₀, all on the cap); `μ_eff` 0.63 → 0.45 vs μ 0.49; no box contact |
+| Li III (CCC, p₀ 42 kPa) | plastic ratio **0 %** at release, 88–95 % while flowing — the per-substep count works |
+| Stomakhin / Drucker–Prager | 95–100 % / 100 % — Stomakhin's box clamp and the cohesionless cone yield almost everywhere |
+| Li V + Voellmy (μ 0.155, ξ 4000), local depth | stable; `μ_eff` 0.25–0.35 (drag + internal); runs 1.4 km |
+| 640 m box, 256 m disc, `seed_anywhere` off (Grossglockner) | seeded share **0.51 %**; 10295 of 65536 active, as 32 attempts at that rate predict (15 %) |
+| 640 m box, Voellmy (Schneeberg) | flow piles against the wall: **wall contacts ~450 000 particle-substeps per run, 0 clamps**. The first version counted only clamps and read 0 — the grid's wall nodes stop the flow before the particle clamp fires, so the counter now uses stencil contact |
+
+Offline: all scripts pass (`test_material_ccc`, `test_material_dp`, `test_friction` with the
+depth argument, `test_mpm` for all three models, `test_energy_line` with the mass-averaged
+path: 0.3024 vs 0.3, unchanged — the slab does not spread on the plane, so both paths agree).
+
+**Benchmark** (headless Chrome, M5, 65 536 particles, `main` vs this branch, alternating):
+
+| | `main` | branch |
+|---|---|---|
+| Cam Clay Li V, ms per substep | 0.52, 0.61 | 0.53, 0.51 |
+| Li V + Voellmy | 0.52, 0.48 | 0.50, 0.51 |
+| G2P per 24-substep run (stage timing) | 2.86 ms | 3.06 ms |
+| Li V centre of mass after 20 runs | 3999.932, 5524.953, 2383.177 | 3999.932, 5524.953, 2383.178 |
+| Li III mean speed after 40 runs | 19.40 m/s | 18.11 m/s |
+
+No measurable cost. Li V is unchanged (everything is at the cap, Case 3 rarely fires); Li III,
+shear-dominated, changes — the shear softening at work. The built-in browser pane's numbers
+were 2–4× slower and are not usable: the pane was hidden (`visibilityState: hidden`), which
+throttles the page.
+
+## 4k. Metres instead of Web Mercator units — measured, 2026-10-10
+
+The release-point mask comes from the normals node, which corrects for Mercator, and marks
+slopes of 30–45°. A temporary probe in `mpm_seed` sampled one random point per thread over the
+whole domain and averaged the slope the **solver** sees (`terrain_normal`) where the mask is set.
+Li V preset, macOS, removed afterwards.
+
+| Scenario | Before (world units as metres) | After (metres) |
+|---|---|---|
+| Breite Ries (47.78 N) | 25.8° | 35.8° |
+| Grossglockner (47.08 N) | 27.3° | 37.4° |
+| Dachstein (47.48 N) | 25.3° | 35.0° |
+
+Before: tan(37°)/1.47 ≈ 27°, exactly the predicted flattening. After: inside the mask's
+30–45° band. The domain is now its nominal size on the ground (Breite Ries: 0.036° of latitude
+for 4000 m, before 0.024°).
+
+Side effect worth knowing: at Dachstein the first run now has thousands of box
+contacts (band ceiling), because the real cliffs are steeper than the flattened terrain was —
+the terrain-following band can hold a step of about (layers − 4)·dx between neighbouring
+columns ([08-domain-size-options.md](08-domain-size-options.md)). The first attempt at this
+measurement mixed those contacts into the probe (same counters); measured cleanly with contact
+counting switched off for one run.
+
+**All real-terrain results before this date** (runout, speeds, the energy-line numbers on the
+Breite Ries in §4g/§4j) were on terrain flattened by ~1.47 and need re-checking.
+
+## 4l. Simulation driver — real time and accuracy (2026-10-24)
+
+Details and the full table in [13-simulation-driver.md](13-simulation-driver.md).
+
+- **Unit tests** (`unittests_webgpu_compute`, 23 sections, fake simulation): real time keeps
+  to the wall clock at 20–144 fps and 0.1–4x; with interpolation the drawn time moves exactly
+  one frame's worth every frame, also at 0.1x where the simulation itself mostly stands still;
+  a too-small budget falls behind without exceeding it and without racing to catch up; the
+  budget uses the best cost since the reset; behind has hysteresis; a stalled frame counts
+  0.25 s at most; a pause or a mode switch closes the open run; accuracy runs keep the old
+  sizes. Forcing the interpolation to 1 fails the drawn-time sections.
+- **On the M5** (map, Hintertux, Medium, `dt` 5.04 ms, 55 s per run, temporary log harness that
+  counts real repaints and the drawn time): 1x Smooth 1.00x at 60 fps and 60 repaints per
+  second, drawn time 16.67 ± 0.3 ms per frame, no still frame; 0.1x: the simulation stands
+  still in 41 frames per second, the picture in none (41 without interpolation); 4x Smooth a
+  steady 2.67x, flagged behind, 60 fps; the simulation keeps running with the GUI hidden.
+- **Found on the way:** the map repainted only when the solver finished a run, so the 3D view
+  had updated once per run (every 8 frames in real time) whatever the simulation did per frame;
+  and the driver ticked after the paint. Both fixed (tick before paint, repaint while playing).
+- **Accuracy unchanged**: batch avaKot / Stomakhin Coulomb at rest after 80.25 s (phase 6:
+  79.60 s), same footprint (12.51 ha) and peak speed (54.01 m/s).
+- Web build: tested manually in the browser (25 Oct): real-time playback and interpolation work.
+
+## 4m. AvaFrame release areas on the map (2026-10-24)
+
+Details in [14-avaframe-release-on-map.md](14-avaframe-release-on-map.md).
+
+- **Unit tests** (`test_ReleaseResampling.cpp`): `resample_release()` keeps volume, area and
+  bounds exactly on aligned grids; an offset region, Web Mercator scaling, a 15° rotation and a
+  coarser grid keep the volume within 5–15 %; no placement or a release outside the region gives
+  none.
+- **On the M5**, the five AvaFrame map scenarios with the data downloaded: release volume on the
+  map within 0.1 % of the dataset's (Kontertal 21,664 vs 21,681 m³ … Madlein 438,914 vs
+  438,846 m³); the release centroid agrees with the independently computed (pyproj) centroid to
+  under half a metre for the four single-area datasets; all particles seeded; no release outside
+  its domain. Without the data the disc is released and the panel says so.
+- Not clicked: the release picker of avaGar. The map's terrain under the release (another DEM than
+  AvaFrame's) is the unquantified part of the approximation.
+
+## 4n. Entrainment (2026-10-27)
+
+- **Data:** the C++ preparation's `entrainment.asc` and `dataset.json` entry are byte-identical
+  to `prepare_dataset.py`'s on all five datasets (scratch harness, as for the original port).
+- **Unit test:** `resample_depth()` keeps an entrainment raster's volume and bounds
+  (`test_ReleaseResampling.cpp`).
+- **Cover mass:** seeded cover equals the dataset's (Hintertux sandbox 258 575 m³ against
+  258 531; on the map 258 413).
+- **Off changes nothing:** batch runs without entrainment reproduce the 11 Oct AIMEC runout
+  differences exactly on all five avalanches.
+- **Against com1DFA 2.1 with entrainment** (five avalanches, erosion and plowing): erosion
+  entrains 80–83 % of com1DFA's volume (Madlein 55 %); mean runout error 119 m with erosion
+  against 149 m without. Details and tables: [15-entrainment.md](15-entrainment.md).
+- **Map:** Hintertux (AvaFrame cover) and Breite Ries (uniform cover) run and entrain; the web
+  build compiles.
+- **Bug on the way:** a first design seeded the whole cover as dormant particles. It needed
+  16 M particles for the generic map cover and seeded nothing there at first, because the map
+  preset's `seed_anywhere` made every cover sample count as "under the release". Replaced by
+  the per-column cover; `under_release()` now limits `seed_anywhere` to the disc.
+
+## 4o. GPU golden tests — the WGSL against the Python ports (2026-11-07)
+
+Sections 2–4e test the Python ports. `unittests/webgpu_compute/test_MpmGolden.cpp` tests the
+WGSL against them. It runs the real shader functions on the GPU (headless Dawn, Catch2) on the
+inputs in `unittests/webgpu_compute/golden/mpm_golden.json` and compares them with the ports'
+outputs in the same file. `scripts/make_golden.py` writes that file from the ports.
+
+Each group runs a one-case-per-thread wrapper kernel that `///use`s the module under test, with
+the real `MpmSolverSettingsUniform` bound at group 0, binding 0. That checks the field order of
+the uniform against `struct MpmSettings` as well. F and τ go through `store_f` / `particle_f` /
+`store_kirchhoff` / `particle_kirchhoff`, as G2P and P2G use them, so the row/column order of
+`struct Particle` is covered too.
+
+| Group | Cases | Largest difference GPU − port | Tolerance |
+|---|---|---|---|
+| `svd3` (incl. repeated and negative σ) | 66 | U Σ Vᵀ − F 4e-7, σ 2e-7, det − 1 8e-7 | 2e-5 |
+| Stomakhin | 65 (38 yielding) | F 2e-7, τ 4e-6 μ₀, J_P 2e-7 | 2e-5, 1e-4 μ₀ |
+| Drucker–Prager, Cases I–III | 64 | F 4e-7, τ 7e-7 μ₀, q 1e-7 | as above |
+| Cam Clay, Li Case V (E 0.14 and 3 MPa), Case II; all four branches, sinh arguments up to 3 | 690 | F 5e-7, τ 2e-6 μ₀, α 3e-7, p₀(α) 5e-7 | as above |
+| Coulomb / Voellmy friction | 114 each | 8e-8 / 2e-7 of \|v\| | 1e-5 |
+| Quadratic B-spline weights | 23 | 1e-6; the 27 weights sum to 1 within 1e-7 | 1e-5 |
+
+The branch taken (yielded or not) matches in every case.
+
+- **The cases keep a margin to every branch decision.** float32 against float64 may
+  legitimately take the other branch right at a decision. The first run hit two such cases, and
+  neither was a shader bug. One was a rotated identity, at the Drucker–Prager apex, where the
+  port's own rounding chose Case III. The other was a velocity exactly tangent to the terrain:
+  in float32, v·n came out −1e-8 instead of 0, so the GPU applied the Voellmy drag.
+- **Found and fixed: float32 cancellation in the Cam Clay sinh and asinh.** p₀ = K sinh(ξ|α|)
+  and the initial α₀ = −asinh(p₀ⁱⁿⁱ/K)/ξ were written with exp / log. Those cancel for a small
+  argument, with a relative error of about ε/x. For Li Case V at E = 3 MPa, x = p₀/K = 1.2e-3,
+  and p₀ came out 8.1e-5 off, α₀ 2.2e-5. `ccc_sinh` and `ccc_asinh` now use the Taylor series
+  below 0.1, cut where the next term is below float32 precision. After the fix: p₀ 1.7e-7,
+  α₀ 6e-8. The cases cover sinh arguments from 0.05 to 3, across the switch at 0.1. The
+  physical effect was small (p₀ to 1e-4), but it was a real shader error that only this test
+  could see.
+- **The tests catch a real bug.** With q = 1.5‖s‖ in `mpm_material_ccc.wgsl` (the old audit's
+  reading of Wolper), all three Cam Clay groups fail: F is off by 1e-3, τ by 2e-3 μ₀, and
+  2–3 cases take the wrong branch.
+- **Not covered:** the kernels as a whole (P2G, grid update and G2P with the fixed-point
+  atomics, the terrain-following band and the textures). The functions they call are covered.
+  `test_mpm.py` ports an older dense-grid loop, so a one-particle substep test needs a new
+  reference first.
+
+## 4p. Whole-kernel substep test — sort, P2G, grid update, G2P on the GPU (2026-11-08)
+
+§4o tests the shader functions. This test runs the kernels themselves with the real bindings,
+which §4o could not: the particle sort, P2G with its workgroup accumulation and fixed-point
+atomics, the grid update with the terrain collision, and G2P with plasticity and particle contact.
+
+`scripts/make_golden_substep.py` places 300 particles on a planar slope (around x = y = 3500 m,
+altitude 2000 m) in a known state: F, C, τ and velocity come from the return mapping of a random
+deformation, so the state is admissible. The particles share grid nodes (a 100 m × 100 m cluster is
+about 8 × 8 cells and straddles a tile boundary), and stencil nodes lie below the terrain, so the
+grid collision with Coulomb friction (μ 0.47) acts. The script advances them in float64 and mirrors
+the shaders step by step, including the fixed-point rounding of the grid accumulators (momentum
+10⁻⁴, mass 2⁻²⁰) and the terrain-following band. `bench/check_substep.mjs` runs the real WGSL
+kernels on the same input (`MpmBench`, the schedule of `MpmSolverNode`) and compares every field of
+`struct Particle`. Two scenarios, for three materials each:
+
+| Scenario | Substeps | What it exercises |
+|---|---|---|
+| free | 1 and 3 | no particle touches the surface; 600 grid-node collisions over the three substeps |
+| contact | 1 | 60 particles start 2–30 mm above the surface moving into it at 3.5–6 m/s; 22 of them touch it (the grid collision already removes part of the normal velocity of the others), plus 206 grid-node collisions |
+
+**Why contact is one substep.** A particle that touched the surface stays within float32 noise of
+it: gravity presses it into the slope by about 10⁻³ m per substep, so in the next substep its
+contact decision (`z < surface`) is a coin flip on the GPU and differs from float64 by about
+0.02 m/s. That is contact flicker, not a kernel error, and it is why a first version with three
+substeps of contact failed for Cam Clay alone: one particle ended within 10⁻⁴ m of the surface and
+took the other branch. The generator now rejects inputs in which a particle ends a substep
+within 4·10⁻⁴ m of the surface (about two float32 spacings at this altitude); in the free scenario
+the nearest particle is 0.44 m away, in the contact scenario 6.9·10⁻⁴ m. The terrain offset avoids
+ties of the column floor and of node against surface within 2 mm.
+
+Largest differences GPU (float32) − reference (float64), Apple M5, Chrome 158:
+
+| Field | Stomakhin | Drucker–Prager | Cam Clay | Tolerance |
+|---|---|---|---|---|
+| position [m], free, 3 substeps | 4.9e-4 | 4.9e-4 | 4.9e-4 | 1e-3 |
+| velocity [m/s] | 3.3e-4 | 3.0e-4 | 2.6e-4 | 2e-3 |
+| C [1/s] | 8.6e-5 | 6.0e-5 | 6.4e-5 | 1e-3 |
+| τ, relative to its largest component | 2.0e-5 | 1.5e-5 | 7.6e-4 | 5e-3 |
+| F | 1.6e-6 | 1.4e-6 | 6.6e-7 | 1e-4 |
+| plastic state | 1.1e-6 | 8.0e-7 | 2.6e-6 | 1e-4 |
+
+The contact scenario (one substep) agrees as closely: velocity 2.3e-4 m/s, position 2.4e-4 m.
+
+- **Position error is float32 spacing.** At 2000–4000 m the spacing is 1.2e-4 to 2.4e-4 m; the
+  4.9e-4 is two spacings after three roundings.
+- **Velocity and C errors are fixed-point rounding.** A contribution evaluated in float32 can land
+  on the other side of a 10⁻⁴ momentum step; through the node weight and 4/Δx that reaches a
+  particle as 10⁻⁴–10⁻³. This is the quantisation of the scheme (§4h), not a kernel error.
+- **The same errors, to the digit, with the shaders from before the sort (`--shaders-rev bac8fd99`)
+  and with the current ones.** The sorted P2G with workgroup accumulation produces exactly the
+  grid of the unsorted one, also through G2P, plasticity and the next substep.
+- **Mutations are detected.** Each of these, applied to a shader, fails the test: P2G stress factor
+  4/Δx² → 3.9/Δx² (Drucker–Prager only: the stress of the other two is too small to show it); G2P
+  APIC factor 4/Δx → 3.9/Δx (all materials); x and y swapped in the P2G window flush (velocity
+  errors of 5 m/s); gravity 1 % low in the grid update (3.4–3.8e-3 m/s); particle contact projected
+  1 mm too high (position 1.2e-3 m); particle contact velocity not corrected (2.5 m/s); the sort's
+  scatter dropping the lowest bit of the index (8 m/s); Cam Clay q = 1.5‖s‖ (τ 3e-2, Cam Clay only).
+- **Also runs on SwiftShader** (3 s, the same tolerances), so it does not need a GPU.
+- **Not covered:** domain walls and the band ceiling (the particles stay in the interior),
+  Voellmy (needs the column depth), entrainment, curved terrain, the carry of the 64-bit mass (the
+  masses are far below 2³² units), and runs longer than three substeps, where the f32/f64
+  differences grow and contact flicker sets in.
+
+## 4q. Raw grid view — the grid velocity buffer (2026-11-09)
+
+Handing out the grid velocity ([16-raw-grid-view.md](16-raw-grid-view.md)) means the whole buffer is
+read, which the solver's own kernels never do, so what §4p does not cover is checked here
+(`check_substep.mjs`, after the free scenario's three substeps with Stomakhin, then with the 300
+particles moved 500 m and one more substep):
+
+| | Result | Expected |
+|---|---|---|
+| Node mass in `w`, summed over all nodes, after the 3 substeps | 300.0000 | 300 (each particle's weights add up to 1) |
+| The same after the move, one substep | 300.0000 | 300 |
+| Velocity on nodes without mass, both times | 0 | 0 |
+
+The second sum is the check on the tile clearing: with the `WAS_ACTIVE` bit switched off the grid
+update never revisits the tiles the flow left and the sum is 600 (measured), the old and the new
+mass. With the shaders from before the change the test fails at once (the mass is not written, and
+the old tiles hold velocity without mass). The whole-kernel errors of §4p are unchanged to the
+digit (velocity 3.3e-4 m/s, position 4.9e-4 m, F 1.6e-6 after three substeps), so the grid update
+change does not touch the physics. The benchmark's centre-of-mass trace is identical to the
+previous kernels' (maximum difference 0 in three A/B runs).
+
+**In the app:** the app starts the avalanche scenario (AvaFrame avaHit on the map) and runs for 48 s
+with the changed grid update and the reset that clears the grid velocity, with no error in the
+log. No reader of the raw view exists yet, so the view itself has not been exercised in the app.
+
 ## 5. On real terrain
 
 Runs end to end on the Schneeberg DEM: seeds, flows downhill, deposits, animates, and the
 domain-centre readout matches the intended coordinates.
 
 **Not quantitatively validated.** No comparison against a real avalanche, a reference
-implementation, or measured runout. The proposal is explicit that this is educational, and
-that should stay explicit in the report.
+implementation, or measured runout. The proposal is explicit that this is educational.
+
+*Since 2026-10-11* there is a comparison against a reference implementation: AvaFrame's
+com1DFA on five real avalanches, rated with AIMEC ([11-avaframe-comparison.md](11-avaframe-comparison.md)).
+Still no comparison against observed runouts.
+
+## 5b. 3D rendering on the map (2026-10-18 to 2026-10-23)
+
+Rendering only reads the particle buffer, so it cannot change a result; what was checked is
+that it shows the flow faithfully. Method, because the app needs a window:
+- A temporary test build without the first-run notice, with the camera framed on the flow at
+  a fixed simulated time and the simulation paused.
+- Settings switched from code between captures of the same frame, for A/B comparisons. A
+  camera nudge of 0.5 m forces the redraw: the app only repaints on change.
+- Window captures by process id.
+- The app's stored preferences and `imgui.ini` were backed up and restored, and the test build was
+  reverted each time.
+
+| Check | Result |
+|---|---|
+| Particles lie on the rendered terrain | Yes: map mode runs on weBIGeo's own height texture; z = altitude / cos(latitude) as in `render_tiles`. |
+| Ellipsoids follow the flow | Stretched along the flow where it moves, spheres at rest (Hintertux 77 s). |
+| Flow surface: 1× vs 3× render grid, same frame | 3× gives a smooth outline, 1× is faceted; a burst during playback shows no popping. |
+| Holes over bumps: no airborne cut-off, then a 1-particle threshold, same frame | Holes stay: no particles within 12 m. A property of the flow, not of the renderer. |
+| Track + snow cover vs neither, same frame | The path stays readable where the flow thinned; avalanche pixels are not painted over by the snow. |
+| Powder vs ellipsoids, same frame | A soft haze over the flow, no hard intersections with terrain or surface. |
+| Entrainable snow on, off and in speed colours, same frame (Madlein, paused at 25 s, 27 Oct) | The cover lies on AvaFrame's entrainment area and ends where the track begins; off, the terrain shows there. |
+| Entrainable snow, bilinear vs Catmull-Rom terrain, same frame | Bilinear: the cover is lit in rectangular blocks of the height texels. Catmull-Rom: smooth. |
+
+**Not checked:** the GPU cost of the renderer, steps 5–8 on scenarios other than
+Hintertux, and the entrainable snow beyond Madlein. The interpolation rule for newly filled
+pool slots is checked by reading only: accuracy playback does not interpolate. The web build was tested manually in the browser (25 Oct) and renders correctly. What is implemented: [12-rendering.md](12-rendering.md).
 
 ## Bugs found and fixed along the way
 
@@ -268,7 +565,9 @@ Worth keeping — they are the interesting part of the implementation story.
 
 3. **Animation stopping.** Stepping was driven from the node editor's settings panel, which
    only renders while that editor is open *and* the node selected. Moved to
-   `AvalanchePanel::draw()`, which runs every frame regardless of panel visibility.
+   `AvalanchePanel::draw()`, which runs every frame regardless of panel visibility — but not
+   with the GUI hidden. Since 2026-10-24 `SimulationDriver` steps it from
+   `ImGuiManager::render()` (§4l).
 
 4. **Normalized coordinates drifting.** Domain/release positions as region fractions moved
    relative to the ground whenever tile snapping changed the region. Switched to lat/lon,
@@ -297,13 +596,23 @@ Worth keeping — they are the interesting part of the implementation story.
    low-weight node, and APIC feeds it back. Fixed by rounding both accumulators and moving
    the mass to a 64-bit `u32` pair at 2⁻²⁰ (§4h). On device afterwards: max speed 21–26 m/s
    for the whole run, `μ_eff` 0.58 → 0.49 against a basal 0.47, flow stops at 340–380 m.
-   Lesson for the report: **verify the numerics at the production scale, including the
+   The lesson: **verify the numerics at the production scale, including the
    integer arithmetic** — the maths port had passed everything.
 
    Detours that were ruled out along the way, so nobody repeats them: particle-level speed
    clamps, a strain-rate limit on the F update, a contact band / two-sided terrain BC,
    smoothed terrain normals, CFL (dt = 0.005 was worse), RPIC (rotation-only C) and a cap
    on `|C·dpos|` — the last two delayed the runaway without removing it.
+
+9. **Every second chunk silently dropped.** `ResolveQuerySet`'s destination offset must be
+   a multiple of 256 (`QUERY_RESOLVE_BUFFER_ALIGNMENT`), but the two timestamp slots were
+   packed at their natural 16 B stride, so slot 1 resolved at offset 16. Dawn then rejected
+   the **whole command buffer** — not just the resolve — so half the chunks never ran: the
+   solver advanced at half speed, the GPU timing never arrived and the adaptive pacing had
+   nothing to pace on. Visible only as a wall of validation messages in the console, never
+   as a wrong number. Fixed with a 256 B stride per slot (`TIMESTAMP_SLOT_STRIDE_BYTES`).
+   Lesson: a validation error on a profiling side-channel can invalidate the work it was
+   measuring — treat the console as part of the test.
 
 6. **Switching the material model without reseeding.** `plastic_state` is model-specific.
    Stomakhin's `Jp = 1` read as Cam-Clay's `α = 1` is a fully softened material with
@@ -335,11 +644,24 @@ MPM_MODEL=ccc ./.venv/bin/python test_mpm.py              # full loop with CCC
 
 # 4b. refactor safety - resolved WGSL vs git HEAD (edit its tables for a new refactor)
 python3 check_refactor_preserving.py
+
+# 4o. GPU golden tests: regenerate the golden file after changing a port, then run the
+# unit test (build with -DALP_BUILD_UNITTESTS=ON)
+./.venv/bin/python make_golden.py
+../../build/webgpu_app_macos_release/unittests/webgpu_compute/unittests_webgpu_compute
+
+# 4p. whole-kernel substep test: regenerate the reference after changing a port, then run it in
+# Chrome (needs Playwright; --chrome is the GPU on macOS, without it SwiftShader)
+./.venv/bin/python make_golden_substep.py
+node ../bench/check_substep.mjs --chrome
 ```
 
-All three were last re-run from this location on 2026-09-06 and reproduce the numbers
-above exactly (mass 150.00, min z 3.00, mean jp 0.7456). `validate_wgsl.py` and
-`check_refactor_preserving.py` were re-run on 2026-09-13 after the dispatcher refactor.
+The Python tests were last re-run on 2026-11-08 and all pass; `test_mpm.py` reproduces the
+numbers above exactly (mass 150.00, min z 3.00, mean jp 0.7456). `validate_wgsl.py` and the GPU
+golden tests last ran on 2026-11-07, the substep test on 2026-11-08; the shaders have not
+changed in between.
+`check_refactor_preserving.py` was last run on 2026-09-13, for the dispatcher refactor its
+tables describe.
 
 `validate_wgsl.py` is the one worth running habitually — WGSL otherwise only fails at
 runtime, and it takes seconds. It keeps a `_resolved_*.wgsl` file for any kernel that fails

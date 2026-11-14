@@ -60,6 +60,7 @@ set(SOURCES
 if (ALP_WEBGPU_APP_ENABLE_COMPUTE)
     list(APPEND SOURCES
         compute/OverlayRenderNode.h compute/OverlayRenderNode.cpp
+        compute/ParticleRenderNode.h compute/ParticleRenderNode.cpp
         compute/NodeGraphPanel.h compute/NodeGraphPanel.cpp
         compute/nodes/NodeRenderer.h compute/nodes/NodeRenderer.cpp
         compute/nodes/NodeRendererFactory.h compute/nodes/NodeRendererFactory.cpp
@@ -74,11 +75,17 @@ if (ALP_WEBGPU_APP_ENABLE_COMPUTE)
         compute/nodes/GPXTrackNodeRenderer.h compute/nodes/GPXTrackNodeRenderer.cpp
         compute/nodes/MpmSolverNodeRenderer.h compute/nodes/MpmSolverNodeRenderer.cpp
         avalanche/AvalanchePanel.h avalanche/AvalanchePanel.cpp
+        avalanche/SandboxView.h avalanche/SandboxView.cpp
+        avalanche/AvaFrameData.h avalanche/AvaFrameData.cpp
     )
 endif()
 
 if (EMSCRIPTEN)
     list(APPEND SOURCES util/WebInterop.h util/WebInterop.cpp)
+endif()
+if (IOS)
+    enable_language(OBJCXX)
+    list(APPEND SOURCES ios/IosScene.h ios/IosScene.mm)
 endif()
 
 qt_add_executable(webgpu_app
@@ -92,12 +99,39 @@ set_target_properties(webgpu_app PROPERTIES
     MACOSX_BUNDLE TRUE
 )
 
+if (IOS)
+    # Signing is per developer, so neither value is hard-coded: a free personal team works for
+    # running on your own device, but needs a bundle identifier nobody else has registered.
+    set(ALP_IOS_BUNDLE_IDENTIFIER "dev.emanum.webigeo" CACHE STRING "iOS bundle identifier")
+    set(ALP_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Apple development team ID for code signing (Xcode > Settings > Accounts)")
+    set_target_properties(webgpu_app PROPERTIES
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${ALP_IOS_BUNDLE_IDENTIFIER}"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${ALP_IOS_BUNDLE_IDENTIFIER}"
+        XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${ALP_IOS_DEVELOPMENT_TEAM}"
+        XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2" # iPhone and iPad
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in" # declares the UIScene, see there
+    )
+    # SDL owns the iOS app lifecycle: SDL_main.h renames our main(), and SDL2main supplies the
+    # real main() that starts UIApplicationMain. Qt would otherwise make _qt_main_wrapper (from
+    # its GUI platform plugin, which this app does not link) the entry point.
+    set_target_properties(webgpu_app PROPERTIES
+        qt_no_entrypoint TRUE
+        XCODE_ATTRIBUTE_LD_ENTRY_POINT "_main"
+    )
+    target_compile_definitions(webgpu_app PRIVATE ALP_PLATFORM_IOS)
+endif()
+
 target_link_libraries(webgpu_app PUBLIC webgpu webgpu_engine Qt::Core Qt::Network)
 target_include_directories(webgpu_app PRIVATE .)
 
 if (ALP_WEBGPU_APP_ENABLE_COMPUTE)
     target_link_libraries(webgpu_app PUBLIC webgpu_compute)
     target_compile_definitions(webgpu_app PRIVATE ALP_WEBGPU_APP_ENABLE_COMPUTE)
+    if (NOT EMSCRIPTEN AND NOT IOS)
+        # The AvaFrame sandbox finds its datasets in <source>/extern/avaframe_sandbox by default.
+        target_compile_definitions(webgpu_app PRIVATE ALP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    endif()
 endif()
 
 # For Font Awesome Icon Headers:
@@ -114,7 +148,7 @@ endif()
 
     target_link_libraries(webgpu_app PRIVATE imgui imnodes)
 
-if (NOT EMSCRIPTEN)
+if (NOT EMSCRIPTEN AND NOT IOS)
     alp_add_git_repository(ImGuiFileDialog URL https://github.com/AlpineMapsOrgDependencies/ImGuiFileDialog_slim.git COMMITISH 39f98eb131ee00d476f1002336fc7e9e1795ccc5)
     target_link_libraries(ImGuiFileDialog PRIVATE imgui)
     target_link_libraries(webgpu_app PRIVATE ImGuiFileDialog)
@@ -172,7 +206,8 @@ if (WIN32 AND NOT EMSCRIPTEN)
         ")
     endif()
     # ================================================
-elseif(APPLE AND NOT EMSCRIPTEN)
+elseif(APPLE AND NOT EMSCRIPTEN AND NOT IOS)
+    # macOS only - on iOS everything links statically and Xcode signs the bundle.
     # Use Qt's macdeployqt to bundle Qt's own frameworks/plugins and fix up
     # their install names/rpaths.
     get_target_property(QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
@@ -210,6 +245,7 @@ if (EMSCRIPTEN)
             #--shell-file "${CMAKE_CURRENT_SOURCE_DIR}/shell/${SHELL_FILE}" # DOESNT WORK AS QT WILL OVERWRITE IT
             -msimd128   #enables auto-vectorization and simd support
             -lembind #enable embind
+            -lidbfs.js #IDBFS: keeps the AvaFrame sandbox folder in the browser (IndexedDB)
             #-gsource-map #generate source maps
 
             # FOLLOWING IS SET BY Qt6.10

@@ -7,20 +7,48 @@ error — so it is written down.
 
 | Quantity | Convention |
 |---|---|
-| `particle.position.xy` | World metres, **relative to the min corner of the region AABB** |
+| `particle.position.xy` | **Metres on the ground**, relative to the min corner of the region AABB. Not world units (see below) |
 | `particle.position.z` | **Absolute altitude** in metres (same units as the height texture) |
 | Texture UV | u grows with +x, **v grows with −y** (`v = 1 − y/region_size.y`) |
 | Grid space | `(position.xy − domain_origin) / dx` horizontally; **`position.z / dx`** vertically, i.e. the z index is absolute altitude in cells. Only a band of layers per column is stored — see below. |
 | Settings lat/lon | `glm::dvec2(latitude, longitude)`, converted in `update_gpu_settings()` |
 
+**Metres, not world units.** The solver works in metres on the ground.
+`MpmSolverNode::update_gpu_settings()` converts region size, domain position and release centre
+to metres with `cos(latitude of the region centre)`, and converts the domain
+box back to world units for the map. One factor per region is enough: across a few kilometres it
+varies by well under 0.1 %. `region_size` in the uniform is therefore in metres; the uv mapping is
+a ratio and does not care. This is due to weBIGeo's world coordinates being Web Mercator, which
+stretches horizontal distances by 1/cos(latitude), 1.47 at 47° N, while heights are real metres:
+taken as metres, every slope would be too flat (a 37° slope at about 27°) and a "4000 m" domain
+only ~2700 m on the ground. Measurement: [06-verification.md](06-verification.md) §4k.
+
 The v-flip matches `avalanche_trajectories_compute.wgsl` and the height texture (row 0 =
 north). `world_to_uv()` is the only place it is applied — go through it.
 
-**Why lat/lon for domain and release centres:** they used to be normalized [0,1] within the
-region. That breaks the moment the region changes, because `SelectTilesNode` snaps to tile
+**Why lat/lon for domain and release centres:** a position normalized to [0,1] within the
+region would break the moment the region changes, because `SelectTilesNode` snaps to tile
 boundaries — the same normalized value lands on different ground. Geographic anchors are
 converted where the region bounds are known, so tile snapping cannot move a scenario
 relative to the terrain.
+
+## Layout version
+
+Code outside the solver reads its buffers with a copy of their layout: the avalanche renderer's
+shaders (`PARTICLE_STRIDE_VEC4`, `COLUMN_STATS_STRIDE_U32`) and, through the raw view, anything that
+reads the grid velocity ([16-raw-grid-view.md](16-raw-grid-view.md)). `MPM_LAYOUT_VERSION` in
+`MpmSolverNode.h` versions what they read: `struct Particle` and `struct ColumnStats`
+(`mpm_common.wgsl`), `grid_velocity` and `column_floor`. `MpmParticleView` and `MpmRawView` carry
+it as `layout_version`.
+
+Changing one of those layouts means:
+
+1. Bump `MPM_LAYOUT_VERSION`.
+2. The build then fails in `ParticleRenderNode.cpp` (a `static_assert` against
+   `AvalancheRenderer::SOLVER_LAYOUT_VERSION`): update the renderer's shader constants and raise
+   `SOLVER_LAYOUT_VERSION`.
+3. Describe the change here and in `16-raw-grid-view.md`. Other readers see the new
+   `layout_version` at run time.
 
 ## `Particle` — 128 bytes
 
@@ -28,14 +56,20 @@ relative to the terrain.
 struct Particle {
     position: vec3f,  mass: f32,     // mass = 0 marks an INACTIVE particle
     velocity: vec3f,  plastic_state: f32,  // per model: Stomakhin Jp (1), DP plastic strain (0), CCC alpha (−asinh(p₀/K)/ξ)
-    c0: vec3f,        volume: f32,   // c0..c2 = rows of the APIC affine matrix C
-    c1: vec3f,        _p1: f32,
-    c2: vec3f,        _p2: f32,
-    f0: vec3f,        _p3: f32,      // f0..f2 = rows of the deformation gradient F
-    f1: vec3f,        _p4: f32,
-    f2: vec3f,        _p5: f32,
+    c0: vec3f,        tau_xx: f32,   // c0..c2 = rows of the APIC affine matrix C
+    c1: vec3f,        tau_yy: f32,
+    c2: vec3f,        tau_zz: f32,
+    f0: vec3f,        tau_xy: f32,   // f0..f2 = rows of the deformation gradient F
+    f1: vec3f,        tau_xz: f32,
+    f2: vec3f,        tau_yz: f32,   // tau = P Fᵀ (symmetric), written by G2P, read by P2G
 }
 ```
+
+The six `tau_*` slots carry the Kirchhoff stress of the particle's current elastic state,
+which G2P computes from the SVD its return mapping already did, so P2G needs no SVD of its own
+([09-performance-analysis.md](09-performance-analysis.md) §2.3). Seeded as zero (F = I is
+stress-free in every model). The particle volume is the same for every particle and comes from
+`settings.particle_volume`.
 
 Every `vec3f` sits at a multiple of 16 — WGSL aligns vec3 to 16 bytes, so the padding floats
 are not optional. Useful scalars are tucked into those slots rather than wasted. Total is
@@ -53,8 +87,21 @@ struct GridNode {
 }
 ```
 
-20 bytes, stride 5 u32 (`GRID_NODE_STRIDE_U32`). `v*` holds **momentum** after P2G and
-**velocity** after the grid update — same slots, reused.
+20 bytes, stride 5 u32 (`GRID_NODE_STRIDE_U32`). Accumulators only: P2G adds into them, the
+grid update reads them, **zeroes them** (there is no separate clear pass any more) and writes
+the node velocity to a separate `grid_velocity: array<vec4f>` (16 B per node), which G2P reads
+with plain loads: `xyz` is the velocity [m/s], `w` the node's mass in units of the normalised
+particle mass (`settings.particle_mass`). Nodes without mass hold zero. Readers of the grid (visualisations) use
+the buffer this way ([16-raw-grid-view.md](16-raw-grid-view.md)).
+
+Next to it, `tile_flags: array<atomic<u32>>` holds one word per tile of 8 × 8 columns with two
+bits: `FLAGGED`, set by P2G for the tiles its stencil touches, and `WAS_ACTIVE`, set by the grid
+update on a tile it processed. The grid update skips tiles with neither bit; a tile with only
+`WAS_ACTIVE` is processed once more so its nodes are zeroed after the flow has left it
+(03-shaders.md, `mpm_grid_update`). After the flags, the same buffer holds the particle sort (03-shaders.md,
+`mpm_sort_*`): a count and a cursor per sort tile of 4 × 4 columns plus one bucket for inactive
+particles, then the sorted particle indices. Sharing the binding keeps the solver at WebGPU's
+default of eight storage buffers per stage.
 
 ## Fixed-point atomics
 
@@ -68,10 +115,12 @@ const MASS_SCALE: f32 = 1048576.0;     // 2^20, u32 lo/hi pair with carry
 Clamping matters: without it a diverging simulation wraps the accumulator and produces
 garbage that looks like a physics bug rather than an overflow.
 
-### Round, don't truncate — and give the mass its own scale (2026-09-13)
+### Round, don't truncate — and give the mass its own scale
 
-The first version truncated every contribution (`i32(x · 1e4)`) and kept the mass in one
-`i32` at the same 1e-4 quantum. That is the bug behind "the simulation never cools down"
+Every contribution is rounded to the nearest quantum, and the mass has its own, finer scale
+(2²⁰ per unit, 64-bit). This is due to the bias of truncation: truncating every contribution
+(`i32(x · 1e4)`) with the mass at the momentum's 1e-4 quantum pumps energy into the flow
+without limit, so it never comes to rest
 (see [06-verification.md](06-verification.md#bugs-found-and-fixed-along-the-way), bug 8).
 The mechanism, because it is not obvious:
 
@@ -90,7 +139,7 @@ The mechanism, because it is not obvious:
 
 Rounding makes the sums unbiased; the finer mass scale removes the remaining ratio noise
 where the mass is only a few units. `test_sheet_fixed_point.py` emulates both schemes:
-the old one runs away by 335 % in 20 s, the new one is within 0.1 % of the rigid block.
+the truncating one runs away by 335 % in 20 s, the rounding one is within 0.1 % of the rigid block.
 
 Why the mass is 64-bit but the momentum is not: mass is non-negative, so the `atomicAdd`
 carry trick from `SimState` works and the range is unlimited. Momentum is signed, and a
@@ -100,8 +149,6 @@ particles per cell (131 k in a 120 m disc at dx 12.5) allow ~450 m/s, far above 
 physical. A very dense seeding is the one way to hit it; see [05-tuning.md](05-tuning.md).
 
 ### The mass normalisation trick
-
-This is the part worth explaining in the report.
 
 Real avalanche masses are large — a grid node can easily see ~10⁶ kg. At scale 1e4 that
 overflows i32 immediately. Choosing a scale factor that works for all scenarios is not
@@ -119,22 +166,44 @@ With k = 1/m_real: mass' = 1, volume' = V_real/m_real = 1/ρ. Grid mass then rea
 "particles in the neighbourhood" — O(10–1000) — and the momentum accumulator's range is a
 statement about particle counts and speeds, not about how much snow the scenario contains.
 
-## `SimState` — 56 bytes
+## `SimState` — 84 bytes
 
 ```wgsl
 struct SimState {
-    min_altitude_cm: atomic<i32>,    // terrain scan, readout only  - written once per reset
-    max_altitude_cm: atomic<i32>,    //                               - written once per reset
-    active_particles: atomic<u32>,   // seeded successfully          - written once per reset
-    max_speed_mm:     atomic<u32>,   // fastest particle this run    - zeroed before each run
-    plastic_particles: atomic<u32>,  // plastic state left initial   - zeroed before each run
-    _reserved: atomic<u32>,
-    sum_x_lo / sum_x_hi,             // 64-bit sums over active particles, zeroed each run:
-    sum_y_lo / sum_y_hi,             //   position * 1e4 (0.1 mm) ...
-    sum_z_lo / sum_z_hi,
-    sum_speed_sq_lo / _hi,           //   ... and |v|^2 * 1e5
+    min_altitude_cm: atomic<i32>,    // 0  terrain scan, readout only  - written once per reset
+    max_altitude_cm: atomic<i32>,    // 1                                - written once per reset
+    active_particles: atomic<u32>,   // 2  seeded successfully          - written once per reset
+    max_speed_mm:     atomic<u32>,   // 3  fastest particle this run    - zeroed before each run
+    plastic_particles: atomic<u32>,  // 4  yielded in the LAST substep  - zeroed by P2G every substep
+    seed_first_hits: atomic<u32>,    // 5  first seeding sample hit     - written once per reset
+    sum_x_lo / sum_x_hi,             // 6  64-bit sums over active particles, zeroed each run:
+    sum_y_lo / sum_y_hi,             // 8    position * 1e4 (0.1 mm) ...
+    sum_z_lo / sum_z_hi,             // 10
+    sum_speed_sq_lo / _hi,           // 12   ... and |v|^2 * 1e5
+    sum_path_lo / _hi,               // 14 horizontal path * 1e5, summed since the RESET
+    ceiling_contacts: atomic<u32>,   // 16 particle-substeps touching the band ceiling - zeroed each run
+    wall_contacts: atomic<u32>,      // 17 ... touching the domain walls             - zeroed each run
+    cover_volume: atomic<u32>,       // 18 entrainment: cover in the domain, 0.01 m^3 - written once per reset
+    entrained_particles: atomic<u32>,// 19 pool slots handed out (can run past the pool) - from the reset on
+    pool_exhausted: atomic<u32>,     // 20 cover the flow could not take, pool full, 0.01 m^3 - from the reset on
 }
 ```
+
+Slots 18–20 (entrainment, 2026-10-27): see [15-entrainment.md](15-entrainment.md). Like 5 and
+14–15 they hold from the reset on, so `reset_run_counters()` leaves them alone.
+
+Three slots changed meaning or were added on 2026-10-03 (audit M1, M2, M3, M5):
+
+- `plastic_particles` is the count of `PlasticReturn.yielded` in the last substep's G2P, which
+  is Li et al. 2021's ratio: the share yielding *at* a time, not the share that has ever yielded.
+- `seed_first_hits` gives the seeded area, and from it the real snow
+  volume per particle the Voellmy depth needs (`seeded_particle_volume()`).
+- `sum_path` is the energy line's `s`, mass-averaged per particle. It is cumulative since the
+  reset, not per run, so a run whose readback is skipped loses nothing.
+
+G2P reduces its diagnostics (max speed, yield count, path, contacts) in workgroup memory and
+touches the global atomics once per workgroup. Before, every particle did a global
+`atomicMax` on one address every substep; the M5 benchmark shows no measurable cost either way.
 
 **Why 64-bit.** A fixed-point sum over 10⁵ particles overflows a `u32` at any useful
 precision, and the obvious dodge — summing `value/N` so the total is the mean — quantises
@@ -144,25 +213,29 @@ The lo/hi pair with carry detection (see `03-shaders.md`, `mpm_splat`) costs one
 branch per add and has no such limit. Reassembled on the CPU by `wide()`.
 
 Written from the CPU on reset via `RawBuffer::write()` with ±INT_MAX so the atomics
-converge; slots 3–4 are zeroed by a 2-element `write()` before every non-reset run.
-**Read back** after each run via `read_back_async()` from the work-done callback into
+converge; before every non-reset run `reset_run_counters()` zeroes slots 3–4, 6–13 and
+16–17 — not 5 and 14–15, which hold from the reset on.
+**Read back** after each run: the last chunk's command buffer copies it into a persistent
+MapRead buffer (`m_state_readback`), which the work-done callback maps into
 `MpmSolverNode::last_state()`; the value therefore describes the previous completed run.
+`RawBuffer::read_back_async()` is not used: it allocates a staging buffer and leaks a command
+buffer per call (09-performance-analysis.md §6).
 
-The buffer is **allocated once in the constructor and never reallocated** — an async
-readback in flight while `ensure_resources()` recreated it would be a use-after-free. It
-is fixed-size, so there is no reason to reallocate it anyway.
+Both buffers are **allocated once in the constructor and never reallocated** — an async
+readback in flight while `ensure_resources()` recreated them would be a use-after-free. They
+are fixed-size, so there is no reason to reallocate them anyway.
 
-## Uniform — 176 bytes
+## Uniform — 240 bytes
 
 Mirrored between `MpmSolverSettingsUniform` (C++) and `MpmSettings` (WGSL). A
-`static_assert(sizeof(...) == 176)` catches size drift, **but not field reordering** — if you
+`static_assert(sizeof(...) == 240)` catches size drift, **but not field reordering** — if you
 add a field, change both sides and check the offsets by hand.
 
 Rules that make the two agree:
 
 - `vec3` aligns to 16, `vec2` to 8, scalars to 4
 - struct alignment = its largest member's (16 here, from the leading `vec3u`)
-- struct size must be a multiple of its alignment → 176 ✓
+- struct size must be a multiple of its alignment → 240 ✓
 - glm types in C++ are tightly packed at 4-byte alignment, which happens to match because
   every `vec2` in this layout already sits at an 8-byte offset
 
@@ -170,22 +243,30 @@ Field groups, in order: grid/particle counts · domain origin+size+dx · region 
 texture dims · dt, gravity, mass, volume · μ₀, λ₀, ξ, θ_c · θ_s, friction, slab, seed ·
 raster dims + domain UV · domain UV size, seed_anywhere, splat radius · density reference,
 release centre x/y, release radius · constitutive_model, basal_friction_model, voellmy_xi, dp_alpha ·
-ccc_m, ccc_beta, ccc_xi, ccc_p0_initial.
+ccc_m, ccc_beta, ccc_xi, ccc_p0_initial · release_mode, release_volume, release_max_depth,
+release_half_y (AvaFrame sandbox, 2026-10-10) · entrainment_mode, cover_mode,
+release_particles, pool_particles · cover_thickness, cover_cos_max_slope, cover_density_ratio,
+erosion_energy · plowing_depth, entrainment_min_speed, snow_density, entrainment_density
+(entrainment, 2026-10-27).
 
-No pad slots left. The next field grows the struct to 192 B.
+No pad slots left. The next field grows the struct to 256 B. The benchmark
+(`bench/mpm_bench.js`) allocates the same size; it sets `release_particles` to all particles
+(no pool) and leaves the rest at zero, which means the disc release without entrainment.
 
 ## Buffer sizes
 
 | Buffer | Size |
 |---|---|
-| particles | `num_particles × 32` u32 (128 B each) |
+| particles | `(num_particles + pool) × 32` u32 (128 B each); the pool for entrained snow is `pool_size` × the release particles while entrainment is on, else 0 |
 | grid | `res.x·res.y·layers × 5` u32 (20 B each) |
 | column floors | `res.x·res.y` i32 |
+| tile flags and particle sort | `⌈res.x/8⌉·⌈res.y/8⌉ + 2·(⌈res.x/4⌉·⌈res.y/4⌉ + 1) + num_particles` u32 (320² and 131 k particles: 0.55 MB) |
 | state | 14 u32 |
 | density raster | `raster_resolution²` u32 |
+| column stats | `res.x·res.y × 6` u32 (24 B: peak depth, peak speed as f32; particle count, speed sum as atomic u32; entrainment cover and its eroded rest as f32) |
 
-Grid memory used to be **O(N³)** — 128³ = 42 MB, 256³ = 335 MB — and that is what kept
-the domain at 1.6 km. It is now `res_xy² × layers`: 320² × 16 = 33 MB for a 4 km domain
+Grid memory is `res_xy² × layers`, not the O(N³) of a dense box grid (128³ = 42 MB, 256³ =
+335 MB, which limits a dense grid to about 1.6 km): 320² × 16 = 33 MB for a 4 km domain
 at 12.5 m, 512² × 16 = 84 MB for 6.4 km.
 
 ## The terrain-following grid (2026-09-13)
@@ -231,7 +312,7 @@ stencil). Nodes deep inside the terrain carried no particles anyway; they only h
 velocity projected. Verified on device: the Breite Ries run on the band grid reproduces
 the dense-grid run to three digits (06-verification.md §5).
 
-The ceiling of the band replaces the old vertical clamp: `mpm_g2p` keeps a particle below
+The ceiling of the band is the vertical limit: `mpm_g2p` keeps a particle below
 `(column_floor + layers − 2.5) · dx`, so its stencil stays inside the stored layers. With
 16 layers at 12.5 m that is 170 m of pile above the ground — nothing reaches it.
 

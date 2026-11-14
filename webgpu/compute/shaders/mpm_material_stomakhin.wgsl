@@ -27,29 +27,37 @@
 //
 // Per-particle plastic state: Jp, the accumulated plastic volume change. 1 = pristine.
 // Parameters: settings.mu_0, lambda_0, hardening (xi), critical_compression (theta_c),
-// critical_stretch (theta_s).
+// critical_stretch (theta_s). Defaults are Stomakhin's Table 2 (p. 5).
+//
+// References (sections, equations and pages as in the PDFs; full list in mpm-mls-doc/refs.md):
+//   Stomakhin 2013  A. Stomakhin et al., "A material point method for snow simulation",
+//                   ACM TOG 32(4), Art. 102, 2013.
+//   Hu 2018         Y. Hu et al., "A moving least squares material point method with displacement
+//                   discontinuity and two-way rigid body coupling", ACM TOG 37(4), Art. 146, 2018.
 
 fn stomakhin_initial_state() -> f32 { return 1.0; }
 
-// First Piola-Kirchhoff stress premultiplied by F^T, as required by the MLS-MPM force term.
-fn stomakhin_stress(f_elastic: mat3x3f, jp: f32) -> mat3x3f {
-    let svd = svd3(f_elastic);
-
-    // Hardening: compacted snow (jp < 1) becomes stiffer.
+// Kirchhoff stress tau = P F^T of the elastic state F = U diag(sigma) V^T, as required by the
+// MLS-MPM force term (Hu 2018 sec. 3.4, eq. 18, p. 7). Energy: Stomakhin sec. 5, eq. 1 (p. 5).
+// Fixed corotated: P = 2 mu (F - R) + lambda J (J - 1) F^-T with R = U V^T, so (F - R) F^T = U
+// (Sigma - I) Sigma U^T and tau is diagonal in the frame of U - no second SVD needed, the return
+// mapping hands over the one it has just done.
+fn stomakhin_kirchhoff(u: mat3x3f, sigma: vec3f, jp: f32) -> mat3x3f {
+    // Hardening: compacted snow (jp < 1) becomes stiffer. Stomakhin sec. 5, eq. 2 (p. 5); the
+    // clamp to [0.05, 20] is ours, not the paper's.
     let h = clamp(exp(settings.hardening * (1.0 - jp)), 0.05, 20.0);
     let mu = settings.mu_0 * h;
     let lambda = settings.lambda_0 * h;
 
-    let r = svd.u * transpose(svd.v); // rotational part of F
-    let j = svd.sigma.x * svd.sigma.y * svd.sigma.z;
-
-    let deviatoric = 2.0 * mu * (f_elastic - r) * transpose(f_elastic);
+    let j = sigma.x * sigma.y * sigma.z;
+    let deviatoric = 2.0 * mu * (sigma - vec3f(1.0)) * sigma;
     let volumetric = lambda * j * (j - 1.0);
-    return deviatoric + identity3() * volumetric;
+    return from_principal(u, deviatoric + vec3f(volumetric));
 }
 
 // Push the elastic deformation gradient back into the admissible range and move the
-// removed part into the plastic state jp.
+// removed part into the plastic state jp. Stomakhin sec. 7, eq. 11-12 (p. 6): clamp sigma to
+// [1 - theta_c, 1 + theta_s], F_E = U Sigma' V^T, F_P = V Sigma'^-1 U^T F.
 fn stomakhin_plasticity(f_trial: mat3x3f, jp: f32) -> PlasticReturn {
     let svd = svd3(f_trial);
 
@@ -61,7 +69,9 @@ fn stomakhin_plasticity(f_trial: mat3x3f, jp: f32) -> PlasticReturn {
     let ratio = (svd.sigma.x / clamped.x) * (svd.sigma.y / clamped.y) * (svd.sigma.z / clamped.z);
 
     var result: PlasticReturn;
+    result.yielded = any(clamped != svd.sigma);
     result.plastic_state = clamp(jp * ratio, 0.05, 20.0);
-    result.f_elastic = svd.u * mat3x3f(vec3f(clamped.x, 0, 0), vec3f(0, clamped.y, 0), vec3f(0, 0, clamped.z)) * transpose(svd.v);
+    result.f_elastic = svd.u * diag3(clamped) * transpose(svd.v);
+    result.kirchhoff = stomakhin_kirchhoff(svd.u, clamped, result.plastic_state);
     return result;
 }

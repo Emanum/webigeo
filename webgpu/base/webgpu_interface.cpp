@@ -118,14 +118,12 @@ WGPUSurface SDL_GetWGPUSurface(WGPUInstance instance, SDL_Window* window)
     }
 #elif defined(SDL_VIDEO_DRIVER_UIKIT)
     {
-        UIWindow* ui_window = windowWMInfo.info.uikit.window;
-        UIView* ui_view = ui_window.rootViewController.view;
-        CAMetalLayer* metal_layer = [CAMetalLayer new];
+        // SDL's Metal view keeps its layer sized to the window, including on rotation; a
+        // CAMetalLayer added by hand keeps the frame it was created with. The surface itself is
+        // reconfigured by the app on SDL_WINDOWEVENT_RESIZED.
+        SDL_MetalView metal_view = SDL_Metal_CreateView(window);
+        CAMetalLayer* metal_layer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(metal_view);
         metal_layer.opaque = true;
-        metal_layer.frame = ui_view.frame;
-        metal_layer.drawableSize = ui_view.frame.size;
-
-        [ui_view.layer addSublayer:metal_layer];
 
 #ifdef WEBGPU_BACKEND_DAWN
         WGPUSurfaceSourceMetalLayer fromMetalLayer;

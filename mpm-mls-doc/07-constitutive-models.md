@@ -1,14 +1,12 @@
-# Constitutive & friction models — status and plan
+# Constitutive and friction models
 
-Written 2026-09-13 against proposal **v3.0** and the *Snow/Avalanche Sim Paper Summaries*
-Notion page. Answers two questions: which of the models named there are actually in the code
-today, and how to make the model layer configurable and exchangeable.
+Which material and friction models the project proposal (v3.0) asks for, which of them are
+implemented and how they were verified, and how the model layer is designed so that models can
+be exchanged. First written 2026-09-13 as a gap analysis; the status is kept current.
 
-The framing from the paper summaries is the right one and worth keeping in your head:
-**the flow solver and the material model are independent layers.** MLS-MPM is the solver.
-The constitutive model is what makes it snow. Basal friction is a *third* thing — a boundary
-condition, not part of either. v3.0 already keeps these verbally separate; the code should
-too.
+The design follows one principle: **the flow solver and the material model are independent
+layers.** MLS-MPM is the solver. The constitutive model is what makes it snow. Basal friction is
+a *third* thing — a boundary condition, not part of either. The code keeps the three apart.
 
 ## 1. What proposal v3.0 asks for (delta vs v1.0)
 
@@ -18,9 +16,9 @@ too.
 | A constitutive model — Stomakhin [5] *or* successors Gaume CCC [11], Li et al. [12,13] | **done** — Stomakhin, Drucker–Prager and Cohesive Cam Clay behind a switch |
 | Model is configurable / regime presets (Li 2021 Table 1) | **done** — switch + seven presets in the sidebar |
 | Basal friction via simple Coulomb using terrain normals | **done**; Voellmy added alongside (2026-09-13) |
-| Single-particle rendering | not done (2D density overlay instead) |
-| Entrainable material along the flow path | **not done** |
-| Compare against non-real-time models (com1DFA / Flow-Py) | not done |
+| Single-particle rendering | **done** — particles in 3D on the map (powder, ellipsoids, spheres) and a flow surface; the 2D density overlay remains — [12-rendering.md](12-rendering.md) |
+| Entrainable material along the flow path | **done** (2026-10-27): com1DFA's plowing and erosion, cover from AvaFrame's entrainment areas or one thickness — [15-entrainment.md](15-entrainment.md) |
+| Compare against non-real-time models (com1DFA / Flow-Py) | **done** — five real avalanches against com1DFA and com4FlowPy (Flow-Py), rated with AIMEC — [11-avaframe-comparison.md](11-avaframe-comparison.md) |
 | CK-MPM (stretch) | not done |
 
 ## 2. What is implemented — verified against the shader source
@@ -38,7 +36,7 @@ Checked line by line:
 | Singular-value box clamp `[1−θc, 1+θs]` | yes | θc = 2.5e-2, θs = 7.5e-3 |
 | Exponential hardening `h = exp(ξ(1−Jp))` | yes | ξ = 10, h clamped to [0.05, 20] |
 | Jp update `Jp ← Jp · Π(σᵢ/σ̂ᵢ)` | yes | clamped to [0.05, 20] |
-| Paper Table 1 defaults | yes | E = 1.4e5, ν = 0.2, ρ = 400 |
+| Paper Table 2 defaults | yes | E = 1.4e5, ν = 0.2, ρ = 400 |
 
 Verified offline: plastic compaction on impact (`jp` 1.0 → 0.746), see
 [06-verification.md](06-verification.md). This is a complete, correct Stomakhin.
@@ -63,7 +61,9 @@ applied where the paper summaries recommend (grid-update pass).
 **Done 2026-09-13:** μ default 0.4 → **0.47** (Li et al. 2021, real terrain). **Voellmy** added
 as a second `BasalFrictionModel` — Coulomb plus the turbulent term `g|v|²/(ξ·h)`, ξ = 4000
 default, `h` = `slab_thickness` as the reference depth so ξ stays in com1DFA units (the
-trajectories node uses the same convention with `h` hard-coded to 1 m). The drag is applied
+trajectories node uses the same convention with `h` hard-coded to 1 m). *(2026-10-03: `h` is
+now the local flow depth of the column, and μ 0.155 / ξ 4000 are com1DFA's Voellmy-option
+values, not its default — see §2h.)* The drag is applied
 at the **grid level only** via an `apply_basal_drag` flag — it depends on `|v|²` not `vn`, so
 applying it at the particle level too would double-count it per substep. Coulomb ignores
 the flag and is bit-identical to before. Verified against the analytic terminal velocity
@@ -75,7 +75,9 @@ the flag and is bit-identical to before. Verified against the analytic terminal 
 (log-strain) elasticity `τ = 2με + λ tr(ε) I` in the principal frame, `P Fᵀ = U diag(τ) Uᵀ`;
 yield surface the friction cone `‖dev τ‖ + α tr τ ≤ 0` with
 `α = √(2/3)·2 sinφ/(3 − sinφ)` precomputed CPU-side from `dp_friction_angle` (default 30°,
-Klár's sand). Return mapping is Klár §5.3's closed-form projection in Hencky-strain space:
+a typical sand value inside the 20–40° sweep of Klár Table 3; Klár's own sand scenes harden
+φ from 25° towards 35°). Return mapping is Klár §7.1's closed-form projection (Eq. 27–28) in
+Hencky-strain space — itself non-associative, it keeps the volume in Case III:
 
 ```
 ε = log Σ,   ε̂ = ε − tr(ε)/3
@@ -85,13 +87,14 @@ if δγ ≤ 0:                             Case I   – elastic
 else:  ε ← ε − δγ · ε̂/‖ε̂‖             Case III – onto the cone
 ```
 
-`plastic_state` accumulates δγ (a free "has this particle yielded" diagnostic); Klár's
-hardening of φ is left out. Cohesionless, so cold-dense regime only — the documented
-fallback if CCC is too slow. Verified: `test_material_dp.py` checks every Case III output
+`plastic_state` accumulates δγ (Klár's hardening state q); Klár's hardening of φ (§7.3,
+Eq. 29–31) is left out. Cohesionless, so cold-dense regime only. It is an alternative
+material, not a performance fallback for Cam Clay: both cost the same per substep
+([09-performance-analysis.md](09-performance-analysis.md) §3.2). Verified: `test_material_dp.py` checks every Case III output
 lands on the cone to `|y| < 1.5e-10` over 500 random gradients; `test_mpm.py` with
 `MPM_MODEL=drucker_prager` shows the qualitative signature (spreads instead of piling).
 
-**One bug caught by the test, worth remembering:** the first draft sent *pure hydrostatic
+**One bug the test caught:** the first draft sent *pure hydrostatic
 compression* to the cone apex because it guarded Case II with `‖ε̂‖ = 0 OR tr > 0`.
 Hydrostatic compression has `ε̂ = 0` but sits *inside* the cone on its axis and must stay
 elastic. With `tr ≤ 0` the second term of δγ is ≤ 0, so `δγ > 0` already implies
@@ -120,13 +123,14 @@ p₀ = K·sinh(ξ·max(−α, 0))                     α = plastic volumetric st
 
 **Return mapping — a documented choice.** Gaume 2018 describes an associative flow rule,
 which needs a per-particle Newton solve on the ellipse. Implemented instead is the
-three-case projection of **Wolper et al. 2019 (NACC)** — the same group's implementation
-of the same surface and hardening law:
+non-associated return of **Wolper et al. 2019 (NACC, §6.2)** — the same group's
+implementation of the same surface and hardening law:
 
 ```
 Case 1  p > p₀          → (p₀, 0),      α += tr ε + p₀/K      (compaction: harden)
 Case 2  p < −βp₀        → (−βp₀, 0),    α += tr ε − βp₀/K     (dilation: soften)
-Case 3  y > 0 otherwise → q onto the ellipse at fixed p, α unchanged
+Case 3  y > 0 otherwise → q onto the ellipse at fixed p,
+                          α += (p× − p)/K  (Wolper §6.2.3; see §2h)
 ```
 
 Explicit: the old p₀ is used for the projection, then hardening is updated. Case 3's
@@ -156,7 +160,7 @@ and Cam-Clay loses shear strength above p₀ — the opposite of DP's cone; stro
 
 `AvalanchePanel::MaterialPreset`, seven entries behind a "Material preset" combo: Stomakhin
 2013 (film snow); Li 2021 Cases I–IV (cold dense, warm shear, sliding slab, warm plug) and
-Case V (Vallée de la Sionne 2003); and a Drucker–Prager cold-dense fallback with φ ≈ 13.3°
+Case V (Vallée de la Sionne 2003); and a Drucker–Prager cold-dense alternative with φ ≈ 13.3°
 derived from M = 0.5. Presets **write the ordinary settings** — model, E, ν, ρ, μ and the
 model-specific parameters — and are not a third configuration path. Applying one forces a
 reseed and pulls `dt` under the new CFL bound (Li's 3 MPa is ~6× the wave speed of
@@ -224,23 +228,63 @@ fix, the Breite Ries run gives `μ_eff` 0.58 → 0.49 over the whole 144 s (basa
 speeds of 21–26 m/s, and the flow stops after 340–380 m. The energy line earned its keep
 on day one.
 
-### 2c. Not implemented
+### 2h. Audit fixes — 2026-10-03
 
-- ~~**Gaume 2018 Cohesive Cam Clay**~~ — **done 2026-09-13**, see §2e.
-- ~~**Li 2020/2021 regime presets**~~ — **done 2026-09-13**, see §2f.
-- ~~**Model selection**~~ — **done 2026-09-13.** `ConstitutiveModel` / `BasalFrictionModel`
-  enums, `u32` uniform fields, runtime `switch` dispatchers, combos in both panels.
-- ~~**Drucker–Prager**~~ — **done 2026-09-13**, see §2d.
-- ~~**Energy-line validation**~~ — **done 2026-09-13**, see §2g.
-- **Entrainment**, **comparison to com1DFA/Flow-Py** — nothing.
+Issue #3's audit ([report-implementation-audit-final-2026-10-03.md](audit-report/report-implementation-audit-final-2026-10-03.md))
+re-checked every formula against the papers. What it changed in the code:
 
-## 3. Making models exchangeable — design
+- **H1, Cam Clay shear hardening.** The fixed-p return was Wolper's NACC for Cases 1–2 but
+  left out Wolper §6.2.3: in Case 3, α moves by `log(J_E,tr/J_E,×)` with `(p×, q×)` the
+  point where the line from the trial state to the ellipse centre meets the ellipse
+  (closed form, see [01-theory.md](01-theory.md) §4c). Shear on the tensile side of the
+  centre now softens, on the compressive side hardens. `test_material_ccc.py` checks the
+  update against an independent bisection and the sign on both sides. On the bench slope the
+  Li V preset (p₀ ≈ the slab's weight, everything at the cap) is unchanged; Li III (p₀ 42 kPa,
+  shear-dominated) flows slower (mean speed 18.1 vs 19.4 m/s after 40 runs).
+- **M1, plastic ratio.** Now the share of particles whose return mapping yielded in the
+  last substep (`PlasticReturn.yielded`), which is Li 2021's definition, instead of "ever
+  left the initial state". Measured on Breite Ries: Li III 0 % at release, ~90 % while
+  flowing; Li V 100 % throughout (the slab's 2.9 kPa weight is ≈ p₀ = 3 kPa).
+- **M2, energy-line path.** `s` is the mass-averaged particle path (Tonnel App. A), summed in
+  G2P per substep, not the centre of mass's path, which is shorter for a spreading flow.
+- **M3, Voellmy depth.** `h` is the local flow depth from the column's node masses and the
+  real volume per particle (seeded area × slab thickness / particles). Checked: a disc fully
+  covered gives depth = slab thickness at release; a 256 m disc over sparse release area
+  read 0.5 % coverage, and the active count matched what 32 seeding attempts at that hit
+  rate predict.
+- **M4, attribution.** μ 0.155 / ξ 4000 are com1DFA's Voellmy-option values; its default is
+  samosAT; the formula is Voellmy's, not in Tonnel 2023.
+- **M5, box boundaries.** G2P counts particle-substeps whose stencil reaches the nodes
+  where the grid update stops outward flow (two outer rows, top three band layers) or that
+  get clamped. The sidebar warns with the share. A 640 m test box showed why counting only
+  the clamps is not enough: the flow piled up against the wall with zero clamps, because the
+  grid had already stopped it.
+- **H2, presets.** Renamed "Li 2021 … parameters" with notes that say what *Li* observed —
+  at 0.5 m cells with the associative rule. ξ is not rescaled with Δx: Li 2021 mentions it,
+  but gives no rule.
+- **L3, L5, D4.** Drucker–Prager's cost claim removed; dt is checked against a CFL bound
+  on the P-wave speed `√((λ+2μ)/ρ)` on every run (`MpmSolverNode::max_stable_dt()`), not
+  only when a preset is applied; Klár section numbers corrected (§7.1/§7.3, not §5.3/§5.4).
 
-### 3a. Follow the codebase precedent: runtime switch on a uniform enum
+### 2i. Not implemented
+
+Everything proposal v3.0 asks for is implemented except CK-MPM (§1). What remains are
+deliberate choices:
+
+- **CK-MPM** [6], the stretch goal: it would change only the P2G/G2P transfers.
+- **The associative Cam Clay return** that Li 2021's presets were calibrated with. The solver
+  uses Wolper 2019's non-associated return (§2e); the associative one would replace only
+  `ccc_plasticity()`.
+- **Friction-angle hardening for Drucker–Prager** (Klár 2016 §7.3): the friction angle is
+  constant (§2d).
+
+## 3. How the models are exchangeable
+
+### 3a. A runtime switch on a uniform enum, as in the trajectory node
 
 `ComputeAvalancheTrajectoriesNode` already does this: `PhysicsModelType` / `FrictionModelType`
 C++ enums → `model_type: u32` / `runout_model_type: u32` in the uniform → `if`/`switch` in
-WGSL → a `Combo` in the node renderer. Same pattern here.
+WGSL → a `Combo` in the node renderer. The solver uses the same pattern.
 
 Why runtime rather than compile-time (`///if` variants):
 - The shader preprocessor's defines are **global**, not per-registration, so per-model
@@ -296,6 +340,10 @@ mpm_material_drucker_prager.wgsl  dp_stress(), dp_plasticity()
 mpm_material.wgsl                 material_stress(), material_plasticity()  — the dispatcher
 ```
 
+*(2026-09-27: the `*_stress()` functions became `*_kirchhoff(U, …)` helpers called at the end of
+each `*_plasticity()`, which now also returns τ = P·Fᵀ; `material_stress()` is gone. P2G reads τ
+from the particle instead of running a second SVD — 09-performance-analysis.md §2.3.)*
+
 Each model file is self-contained and `///use`d by the dispatcher. `mpm_p2g` / `mpm_g2p` call
 only the dispatcher. **Adding a model = one new file + one `case` + one enum entry + one
 combo item.** Same for `mpm_friction.wgsl` dispatching Coulomb / Voellmy.
@@ -336,63 +384,16 @@ Table 1 (the regime cases were designed for the same slope):
 | VdlS 2003 (verification) | CCC | 0.7 | 0.2 | 0.002 | 3 | 200 | 3 MPa | 0.3 | 0.49 |
 | Stomakhin 2013 | Stomakhin | — | — | 10 | — | 400 | 1.4e5 | 0.2 | 0.47 |
 
-Two traps from the paper summaries, now baked into the table so they aren't rediscovered:
+Two points from Li 2021 that the table follows:
 **warm plug has the lowest M with the highest β** (counter-intuitive but correct), and **ξ is
 what separates sliding slab from warm plug**, not Mβ. Also: Cases II and III did *not*
-reproduce their 2D regimes on real terrain in Li 2021 — expect re-tuning, say so in the
-report.
+reproduce their 2D regimes on real terrain in Li 2021, so the presets may need re-tuning on
+other terrain.
 
 The existing `Scenario` struct (location) and a material preset are orthogonal; a scenario
 can name a default preset but the two stay separate.
 
-## 4. Next steps, in order
-
-Ordered so each step is independently useful and the risky physics comes after the plumbing
-that will be needed to test it.
-
-**1. Refactor for exchangeability — no new physics.** ✅ **Done 2026-09-13.** Split
-`mpm_material_stomakhin.wgsl` out, added `mpm_material.wgsl` / `mpm_friction.wgsl`
-dispatchers, both enums, the uniform/settings fields (144 → 160 B), the two combos, renamed
-`jp` → `plastic_state`, added `material_initial_state()` to the interface (the initial
-plastic state is model-dependent: Jp = 1 vs εᵥᵖ = 0). Proven behaviour-preserving by diffing
-the resolved WGSL against HEAD — see [06-verification.md](06-verification.md#4b-refactor-safety--resolved-shader-diff-against-head).
-All 8 pipelines confirmed on Metal.
-
-**2. Basal friction: μ → 0.47, add Voellmy.** ✅ **Done 2026-09-13.** See §2b. First real
-second case in a dispatcher; `test_friction.py` checks it.
-
-**3. Drucker–Prager (Klár 2016).** ✅ **Done 2026-09-13.** See §2d. Hencky elasticity is
-now in and verified, which CCC reuses.
-
-**4. Cohesive Cam Clay (Gaume 2018).** ✅ **Done 2026-09-13.** See §2e — including the
-return-mapping choice (Wolper's three-case projection rather than the associative rule).
-
-Still true and still worth doing: **benchmark it.** Nobody has run CCC interactively. Per
-particle it is one SVD plus a handful of scalars — same order as Stomakhin — so it should be
-fine, but that is an expectation, not a measurement. And the CFL note stands: at Li's
-E = 3 MPa, ρ = 250 the wave speed is ~110 m/s vs ~19 m/s at Stomakhin's values, so the
-allowed dt drops ~6×. The CFL readout already uses the shared E, so switching a preset will
-show it.
-
-**5. Regime presets** ✅ **Done 2026-09-13.** See §2f — presets, the plastic-particle
-readout, and the readback it needed.
-
-**6. Energy-line validation** ✅ **Done 2026-09-13.** See §2g. Offline: basal friction
-recovered to < 1 %. On-device: live `μ_eff` readout — which immediately exposed the
-fixed-point energy pump (06, bug 8). Fixed the same day; the sliding-slab and Stomakhin
-runs now cool down and stop.
-
-**7. Entrainment.** Input: an entrainable-snow-depth texture (v3.0 says computing it is out
-of scope). Cheapest MPM-compatible mechanism: a flowing particle over a cell with entrainable
-depth **gains mass and volume** and the cell's depth decrements — no particle spawning, no
-free list. Note this breaks the current "mass = 1" invariant into "mass = 1 base unit,
-growing"; the fixed-point range still holds. Rate law needs research (Sovilla-style
-erosion ∝ velocity is the usual starting point). The CCC papers explicitly exclude
-entrainment and blame their velocity discrepancies on it — state that.
-
-**8. Comparison to com1DFA / Flow-Py** (v3.0's final stage) — needs 6 first.
-
-## 5. Sources
+## 4. Sources
 
 Numbering per the proposal. Full entries in [refs.md](refs.md).
 
@@ -402,4 +403,3 @@ Numbering per the proposal. Full entries in [refs.md](refs.md).
 - [13] Li, Sovilla, Jiang, Gaume 2021 — 3D real terrain + Table 1, *Landslides* 18, 3393
 - Klár et al. 2016 — Drucker–Prager, *ACM TOG* 35(4)
 - Tonnel et al. 2023 — com1DFA (Coulomb/Voellmy/samosAT, energy line test), *GMD* 16, 7013
-- Full paper notes: Notion → *Snow/Avalanche Sim Paper Summaries*
