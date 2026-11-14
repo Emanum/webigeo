@@ -2,6 +2,10 @@
 
 Technical reference of the MLS-MPM snow avalanche solver in weBIGeo.
 
+Detailed documentation (design rationale, verification, performance analysis and benchmarks,
+AvaFrame comparison, scripts) is in the project repository:
+[Emanum/webigeo, `mpm-mls-doc/`](https://github.com/Emanum/webigeo/tree/main/mpm-mls-doc).
+
 ## Components
 
 | Component | Where | Doc |

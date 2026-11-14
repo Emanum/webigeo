@@ -123,7 +123,8 @@ constexpr const char* DEFAULT_SANDBOX_ROOT = "";
 // Particles per cell are far above the 8 of Li et al. 2021 at every level (a 100 m release
 // disc at 12.5 m cells is ~200 columns), so fewer particles mostly thin the rendered cloud
 // rather than coarsen the mechanics. 12 layers still leave ~90 m of headroom above the
-// terrain at 12.5 m cells. See 09-performance-analysis.md, "Defaults".
+// terrain at 12.5 m cells. See
+// https://github.com/Emanum/webigeo/blob/main/mpm-mls-doc/09-performance-analysis.md, section 1.
 constexpr AvalanchePanel::DetailPreset DETAIL_PRESETS[] = {
     { "Low (fast)", 32768u, 10u },
     { "Medium", 65536u, 12u },

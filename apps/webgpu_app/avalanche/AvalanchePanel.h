@@ -127,7 +127,8 @@ public:
     };
 
     /// Resolution presets: particle count and grid band height, the two knobs that decide
-    /// the GPU cost (see 09-performance-analysis.md). Domain and cell size stay per scenario.
+    /// the GPU cost. Domain and cell size stay per scenario. See
+    /// https://github.com/Emanum/webigeo/blob/main/mpm-mls-doc/09-performance-analysis.md.
     struct DetailPreset {
         const char* name;
         uint32_t particles;

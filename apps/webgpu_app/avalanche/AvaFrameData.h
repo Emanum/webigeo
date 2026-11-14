@@ -33,7 +33,8 @@ namespace webgpu_app {
 /* The AvaFrame sandbox datasets, prepared in the app: a C++ port of
  * https://github.com/Emanum/webigeo/blob/main/mpm-mls-doc/avaframe/prepare_dataset.py for the five real test avalanches. The inputs are
  * downloaded at run time from AvaFrame's public repository, pinned to the commit of release 2.1,
- * so weBIGeo does not redistribute them (see 11-avaframe-comparison.md, "Native build only").
+ * so weBIGeo does not redistribute them (see "Data not shipped with weBIGeo" in
+ * https://github.com/Emanum/webigeo/blob/main/mpm-mls-doc/11-avaframe-comparison.md).
  *
  * The output is the same as the script's: dataset.json, dem.asc, release_<scenario>.asc,
  * reference/<benchmark>/{pft,pfv,ppr}.asc and params.json, and the dataset's entry in

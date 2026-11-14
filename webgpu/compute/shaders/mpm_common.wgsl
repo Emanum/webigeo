@@ -166,7 +166,8 @@ struct Particle {
 // float add. Particle mass is normalised to 1, so a node accumulates roughly the number
 // of particles in its neighbourhood.
 //
-// Two things matter here, both learned the hard way (06-verification.md, sheet test):
+// Two things matter here, both learned the hard way (sheet test, section 4h of
+// https://github.com/Emanum/webigeo/blob/main/mpm-mls-doc/06-verification.md):
 //  - Contributions are ROUNDED, not truncated. Truncation toward zero shrinks a small
 //    mass contribution by more (relative) than the matching momentum contribution, so
 //    momentum / mass comes out too large at every low-weight node. APIC then carries
