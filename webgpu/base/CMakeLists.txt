@@ -63,6 +63,13 @@ set(SOURCES
     wgpu_string.h
     webgpu_interface.hpp webgpu_interface.cpp)
 
+if (APPLE)
+    # webgpu_interface.cpp uses Cocoa/CAMetalLayer (Objective-C) under SDL_VIDEO_DRIVER_COCOA,
+    # so it needs to be compiled as Objective-C++, not plain C++.
+    enable_language(OBJCXX)
+    set_source_files_properties(webgpu_interface.cpp PROPERTIES LANGUAGE OBJCXX)
+endif()
+
 add_library(webgpu STATIC ${SOURCES})
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
