@@ -100,7 +100,7 @@ function(alp_find_local_dawn_package out_var)
 endfunction()
 
 function(alp_mark_local_dawn_package)
-    foreach(ALP_DAWN_MARK_CONFIG Debug Release ${ALP_DAWN_CONFIG})
+    foreach(ALP_DAWN_MARK_CONFIG Debug Release)
         set(ALP_DAWN_MARK_DIR "${ALP_DAWN_DIR}/install/${ALP_DAWN_MARK_CONFIG}")
         if (EXISTS "${ALP_DAWN_MARK_DIR}")
             file(WRITE "${ALP_DAWN_MARK_DIR}/.alp_dawn_version" "${ALP_DAWN_VERSION}\n")
@@ -213,7 +213,7 @@ else()
     endif()
 
     set(Dawn_DIR "${ALP_DAWN_CMAKE_PACKAGE}")
-    find_package(Dawn REQUIRED CONFIG PATHS "${ALP_DAWN_CMAKE_PACKAGE}" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+    find_package(Dawn REQUIRED CONFIG PATHS "${ALP_DAWN_CMAKE_PACKAGE}" NO_DEFAULT_PATH)
     target_link_libraries(webgpu PUBLIC dawn::webgpu_dawn)
 
     # Ensure SDL is installed
@@ -247,7 +247,6 @@ else()
                 --cmake-path "${ALP_CMAKE_EXECUTABLE}"
                 --ninja-path "${ALP_NINJA_EXECUTABLE}"
                 --git-path "${ALP_GIT_EXECUTABLE}"
-                ${ALP_SDL_PLATFORM_ARGS}
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             RESULT_VARIABLE SDL_RESULT
         )
