@@ -76,6 +76,7 @@ weBIGeo already had a statistical trajectory model for avalanches. This project 
 | [16-raw-grid-view.md](16-raw-grid-view.md) | **Raw grid data**: the grid velocity the solver hands out to visualisations and exports, its layout, what the solver guarantees and what to watch when reading it. |
 | [13-simulation-driver.md](13-simulation-driver.md) | **Playback**: the generic `TimeSteppedSimulation` interface and `SimulationDriver`, real time (fixed-step loop with interpolation, one chunk per frame, 0.1–4x) vs accuracy, with measurements. |
 | [avaframe/](avaframe/README.md) | **AvaFrame comparison, phase 1**: prepares AvaFrame's test cases (DEM, release, com1DFA reference rasters, AIMEC path, map overlays) for comparing against the MPM solver. |
+| [17-upstream-merge.md](17-upstream-merge.md) | **Upstream merge** (provisional, weBIGeo moves to plugins): the branches (`main`, `upstream-candidate`, `upstream-main`), what goes to weBIGeo and what stays here, verification state, open items, and how the history is cleaned for the merge request while the fork keeps its own. |
 | [refs.md](refs.md) | Bibliography. |
 
 ## 60-second orientation

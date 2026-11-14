@@ -13,6 +13,64 @@ capture of the terminal.
 
 ---
 
+## 2026-11-14 — Upstream preparation, PR #2, iOS cleanup, before the freeze
+
+### 1. Upstream merge: target, branches, plan
+
+**Target.** The merge goes to **weBIGeo/webigeo** (the fork's GitHub parent). The local remote named
+`upstream` is AlpineMapsOrg/renderer; a rebase onto it was started by mistake and undone (AlpineMaps has
+since moved `Raster` into radix and restructured its CMake, which weBIGeo's `main` has not). Remote
+`webigeo` added.
+
+**Branches.** `main` is the dev/release branch and keeps everything. `upstream-candidate` = `main` minus
+project notes, the iOS port, the validation tooling (`mpm-mls-doc/` except the docs moved to
+`docs/avalanche/`), the graph auto-load at launch, local paths; workflows as on weBIGeo. It takes
+merges from `main` (last: `35dbee35`, with PR #2). `upstream-main` mirrors `webigeo/main` (1b3f3cbb) and is
+the base of the draft staging PR #19, which shows the diff weBIGeo would receive (not to be merged; no
+CI there, weBIGeo's workflows only run for PRs into `main`). A cloud session added four commits to the
+candidate (iOS leftovers in `webgpu/base/CMakeLists.txt`, macOS build docs, `docs/avalanche/` cut to a
+technical reference, fork-only docs linked to Emanum/webigeo).
+
+**History.** weBIGeo should not get the candidate's 147 commits (they add and delete the bloat). For the
+merge request a new branch from `webigeo/main` gets the candidate's final tree as one or a few commits;
+`main` is never rewritten, and after weBIGeo merges, `webigeo/main` is merged back into `main`.
+
+**Submission.** The course submission is this fork's `main`; the upstream merge is not part of it and
+continues later.
+
+**Documented** in [mpm-mls-doc/17-upstream-merge.md](mpm-mls-doc/17-upstream-merge.md), marked provisional:
+weBIGeo is going to move to a plugin-based structure, so the way in will change (the simulation becomes a
+plugin rather than a merge of these files).
+
+**Presets.** Qt paths are `$env{HOME}/Qt/6.11.1/...` on `main` (`c94986c6`); on the candidate the wasm
+preset is weBIGeo's own (`C:/Qt/6.10.1/...`), so the IDE cannot load that profile on this Mac and Rider
+drops its generated run configurations there: develop on `main`.
+
+### 2. PR #2: use-after-free fixes merged
+
+PR #2 (pipeline factories unregister through a `PipelineRegistration` handle; nodes finish async work
+through a lifetime token) was brought up to date by merging `main` into it (`1253dfc3`; a rebase onto
+`main` would have been preferred). Decisions: `MpmSolverNode`'s own workaround (one shared factory for
+all solver instances) replaced by the handle, its GPU callbacks keep `main`'s lifetime token;
+`AvalancheRenderer` (new on `main`) now keeps its registration handle, otherwise F5 would skip the
+avalanche pipelines.
+
+**Checked.** macOS release build with unit tests: the two new registry tests pass, `webgpu_compute`
+passes (1900 assertions); the failures are the known ones (tile scheduler timing, two benchmarks). CI
+on the PR all green; merged by Manuel (`8d7712dc`). Manual test by Manuel (F5 after switching graphs,
+replacing the graph while playing, F5 updates the avalanche, regression pass): passed.
+
+### 3. Temporary iOS diagnostics removed (`848057a6`)
+
+The SDL event log, the stdout/stderr redirect to `Documents/webigeo.log` and the "main loop ended" line
+(which printed on macOS too) are gone; `docs/webgpu_app_ios.md` no longer describes the log file.
+
+### 4. Web storage verified
+
+The IndexedDB storage of the AvaFrame sandbox folder (previous entry) was tested by Manuel in a browser:
+it works, the download survives a reload. Not separately tested: dropping data of an older AvaFrame
+commit (the marker check) and its write-back.
+
 ## 2026-11-13 — AvaFrame data: runtime-only downloads, kept in the browser (IDBFS)
 
 **Downloads.** The app downloaded `LINES/path_aimec.shp` and `POINTS/splitPoint.shp` per dataset
