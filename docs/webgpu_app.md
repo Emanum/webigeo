@@ -9,7 +9,7 @@ For an overview of the internal architecture, see the [Developer Guide](webgpu_a
 
 ## Setup
 
-weBIGeo can be deployed to the web via emscripten and additionally we support native builds on Windows, using [Dawn](https://dawn.googlesource.com/) and [SDL2](https://github.com/libsdl-org/SDL/tree/SDL2).
+weBIGeo can be deployed to the web via emscripten and additionally we support native builds on Windows and macOS, using [Dawn](https://dawn.googlesource.com/) and [SDL2](https://github.com/libsdl-org/SDL/tree/SDL2).
 
 ### CMake Presets
 | Preset | Description |
@@ -18,6 +18,8 @@ weBIGeo can be deployed to the web via emscripten and additionally we support na
 | **webgpu_app_msvc_release** | MSVC Release build for Windows (native) |
 | **unittests_msvc_debug** | MSVC Debug build for unit tests |
 | **unittests_msvc_release** | MSVC Release build for unit tests |
+| **webgpu_app_macos_debug** | Clang Debug build for macOS (native, macOS hosts only) |
+| **webgpu_app_macos_release** | Clang Release build for macOS (native, macOS hosts only) |
 | **webgpu_app_wasm_debug** | WebAssembly Debug build |
 | **webgpu_app_wasm_release** | WebAssembly Release build |
 | **webgpu_app_wasm_publish** | WebAssembly Production build with minified shaders and no debug output |
@@ -59,6 +61,9 @@ After building, you can use the `serve_wasm.py` script to serve the build files 
 
 ### Building the native version
 
+> [!NOTE]
+> The dependencies and configuration below are for Windows. For macOS see [Building the native version on macOS](#building-the-native-version-on-macos).
+
 #### Dependencies
 * Windows
 * Qt 6.10.1 with
@@ -85,6 +90,41 @@ If you use the Cmake Presets make sure that **Qt6_DIR** points at your actual Qt
 #### About DAWN Backends
 In the normal flow, a prebuilt Dawn binary is downloaded during CMake configuration and includes multiple backends. If the download fails and Dawn is built from source via `misc/scripts/install_dawn.py`, only the Vulkan backend is enabled -> you can change this by modifying the CMake flags in that script.
 
+### Building the native version on macOS
+
+The native macOS build renders through Dawn (Metal) and uses SDL2 for the window. The macOS presets only exist on a macOS host.
+
+#### Dependencies
+* macOS with the Xcode command line tools (`xcode-select --install`): Apple Clang, plus `install_name_tool` and `codesign`, which the bundling step needs. The WebGPU interface (`webgpu_interface.cpp`) uses Cocoa/CAMetalLayer and is therefore compiled as Objective-C++.
+* Qt 6.11.1 for macOS, installed to the Qt installer's default location (`~/Qt/6.11.1/macos`). This is the version CI uses (`.github/ci-versions.env`).
+* Python 3
+* cmake, ninja and git (cmake and ninja come with Qt; git is used to build SDL)
+
+#### Configuration
+The macOS presets use Ninja, build into `build/<preset>` and find Qt through `CMAKE_PREFIX_PATH`, which `webgpu_macos_base` sets to `$HOME/Qt/6.11.1/macos/lib/cmake`. If your Qt is installed elsewhere, or is another version, override it on the command line or edit it in `CMakePresets.json`:
+```bash
+cmake --preset webgpu_app_macos_release -DCMAKE_PREFIX_PATH=/path/to/Qt/6.11.1/macos/lib/cmake
+```
+
+#### Build and run
+```bash
+cmake --preset webgpu_app_macos_release
+cmake --build --preset webgpu_app_macos_release
+open build/webgpu_app_macos_release/apps/webgpu_app/webgpu_app.app
+```
+Use `webgpu_app_macos_debug` for a Debug build. As on the other platforms, the first configuration fetches Dawn and builds SDL (see *Troubleshoot* above).
+
+After linking, two post-build steps turn the `.app` into a self-contained bundle:
+1. `macdeployqt` copies Qt's frameworks and plugins into it (skipped if `macdeployqt` is not found next to `qmake`).
+2. `cmake/alp_macos_deploy.cmake` copies the non-Qt libraries the app links (SDL2, radix, glm, stb_slim, ktx) into `Contents/Frameworks`, adds an `@executable_path/../Frameworks` rpath and signs the bundle ad hoc, because Apple Silicon refuses to launch an unsigned executable.
+
+The result no longer points into the build tree, so the `.app` can be moved. It is signed ad hoc and not notarized: if macOS blocks it after you copied it to another Mac, remove the quarantine flag with `xattr -dr com.apple.quarantine webgpu_app.app`.
+
+#### Troubleshoot
+- **CMake cannot find `install_name_tool` or `codesign`**: install the Xcode command line tools with `xcode-select --install`.
+- **Qt6 is not found**: check `CMAKE_PREFIX_PATH` (see Configuration above).
+- **The Dawn download fails**: the macOS package is the `*-macos-latest-<Debug|Release>.tar.gz` asset of the Dawn release named by `ALP_DAWN_VERSION` in `webgpu/base/CMakeLists.txt`. If fetching it fails, CMake falls back to building Dawn from source, which enables only the Vulkan backend (Metal is switched off in `misc/scripts/install_dawn.py`). That is not a way to get a working macOS build: fix the download (network or GitHub access) and reconfigure.
+
 ### Install Targets
 Install targets are now available for both web and native builds. These targets install all necessary files into the install directory, making it easy to deploy or distribute the built application.
 
@@ -95,6 +135,7 @@ cmake --build build/<preset-name> --target install
 
 The install directory is automatically configured in the CMake presets and will be located at:
 - Native builds: `install/webgpu_app_msvc_debug` or `install/webgpu_app_msvc_release`
+- macOS builds: `install/webgpu_app_macos_debug` or `install/webgpu_app_macos_release` (holds `webgpu_app.app`)
 - Web builds: `install/webgpu_app_wasm_debug`, `install/webgpu_app_wasm_release`, or `install/webgpu_app_wasm_publish`
 
 ### Tested Coding Environments
