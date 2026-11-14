@@ -200,6 +200,7 @@ private:
     webgpu::Context* m_ctx = nullptr;
     Source m_source;
     const void* m_source_owner = nullptr;
+    webgpu::PipelineRegistration m_pipeline_registration; // unregisters the factory below with the renderer
     std::unique_ptr<webgpu::raii::GenericRenderPipeline> m_pipeline;
     std::unique_ptr<webgpu::raii::RenderPipeline> m_powder_pipeline;
     std::unique_ptr<webgpu::Buffer<GpuConfig>> m_config;

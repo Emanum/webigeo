@@ -125,7 +125,7 @@ void AvalancheRenderer::init(webgpu::Context& ctx)
             "avalanche surface bind group layout");
     });
 
-    reg.register_pipeline([this](WGPUDevice dev, const webgpu::RenderResourceRegistry& reg) {
+    m_pipeline_registration = reg.register_pipeline([this](WGPUDevice dev, const webgpu::RenderResourceRegistry& reg) {
         // Powder: premultiplied "over" onto the lit frame, no depth attachment (the shader fades
         // against the G-buffer depth itself), like the track lines.
         WGPUBlendState blend_state {};

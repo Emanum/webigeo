@@ -615,6 +615,7 @@ private:
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_refresh_stress_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_splat_pipeline;
     std::unique_ptr<webgpu::raii::CombinedComputePipeline> m_rasterize_pipeline;
+    webgpu::PipelineRegistration m_pipeline_registration;
 
     /* Bind group cache key: rebuilt when our buffers or the upstream textures change. A full
      * graph run gets a new run id, which covers upstream nodes recreating their textures. */
