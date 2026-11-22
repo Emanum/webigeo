@@ -3,8 +3,9 @@ name: Preview
 # Builds the multithreaded web release of any branch of this repository and pushes it as an image
 # to the owner's registry: <registry>/webigeo-preview:<name>. Started by hand (Actions -> Preview ->
 # Run workflow, input: the branch). It does not run on push or pull request and does not touch
-# the other workflows. The preview server (a Portainer stack that updates from git) pulls the new
-# image by itself. Setup, secrets and variables: .github/preview/README.md
+# the other workflows. The preview server is a Portainer stack from git; after the push this workflow
+# calls the stack's webhook (secret, optional) so it fetches the new image.
+# Setup, secrets and variables: .github/preview/README.md
 #
 # No host names, accounts or addresses are written in this file: they all come from the
 # secrets and variables of the "previews" environment.
@@ -227,6 +228,18 @@ jobs:
           org.opencontainers.image.revision=${{ env.BRANCH_SHA }}
           org.opencontainers.image.description=Web preview of branch ${{ inputs.branch }}
 
+    - name: Tell the preview server to update
+      env:
+        WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+      run: |
+        if [ -z "$WEBHOOK_URL" ]; then
+          echo "No PORTAINER_WEBHOOK_URL secret set, the preview server is not told to update."
+          exit 0
+        fi
+        echo "::add-mask::$WEBHOOK_URL"
+        curl --fail --silent --show-error --max-time 120 -X POST "$WEBHOOK_URL"
+        echo "Webhook called."
+
     - name: Summary
       env:
         TOPIC: ${{ steps.topic.outputs.topic }}
@@ -236,7 +249,7 @@ jobs:
           echo "### Preview image of \`$BRANCH\`"
           echo
           echo "Pushed as \`webigeo-preview:$TOPIC\` (commit \`${BRANCH_SHA::10}\`)."
-          echo "The preview server updates from git; the address is"
+          echo "The preview server was told to update; the address is"
           echo
           echo "https://$TOPIC.$PREVIEW_DOMAIN/webgpu_app.html"
         } >> "$GITHUB_STEP_SUMMARY"

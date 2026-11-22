@@ -15,8 +15,11 @@ upstream. One container per branch; the address is `https://<name>.<preview doma
   the cache. The workflow starts by hand only; it does not run on push or pull request and does not
   change the other workflows.
 - **Show it:** the preview server is a Portainer stack that updates from a git repository (GitOps):
-  one service per preview, each running `webigeo-preview:<name>`. Portainer re-pulls the images on
-  its update interval and redeploys what changed. The workflow itself never talks to the server.
+  one service per preview, each running `webigeo-preview:<name>` with `pull_policy: always`. After
+  the push the workflow calls the stack's webhook (secret below), which redeploys the stack and
+  fetches the new image. The webhook can only redeploy that one stack; no server credentials are
+  stored in GitHub. Without the secret the step is skipped and the stack's *Pull and redeploy*
+  button does the same by hand.
 - **New preview:** run the workflow once for the branch (the image has to exist), then add a service
   named `webigeo-preview-<name>` to the stack's compose file in git.
 - **Remove a preview:** delete its service from the compose file.
@@ -28,8 +31,9 @@ Preview workflow (workflow_dispatch, runs from main)
   checkout <branch> -> Qt/Emscripten build (wasm_mt, as in deploy.yml)
   -> image: nginx + build, with the cross-origin isolation headers
   -> push to the registry   <registry>/webigeo-preview:<name>
+  -> POST to the stack's webhook (optional)
 
-Portainer stack "previews" (compose file in git, GitOps updates, re-pull image)
+Portainer stack "previews" (compose file in git, pull_policy: always)
   -> container webigeo-preview-<name> on the reverse proxy's Docker network
   -> the server routes <name>.<preview domain> to the container of that name
 ```
@@ -46,6 +50,7 @@ only: the workflow file is read from `main`, and the secrets must not be reachab
 | --- | --- | --- |
 | `DOCKER_REPO_USERNAME` | secret | registry user that may push the preview images |
 | `DOCKER_REPO_PASSWORD` | secret | its password |
+| `PORTAINER_WEBHOOK_URL` | secret | webhook URL of the preview stack; optional, makes a push show up at once |
 | `PREVIEW_REGISTRY` | variable | registry host, no `https://` |
 | `PREVIEW_DOMAIN` | variable | the domain below `<name>.`, only used to print the address |
 
