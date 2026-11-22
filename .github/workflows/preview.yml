@@ -1,0 +1,242 @@
+name: Preview
+
+# Builds the multithreaded web release of any branch of this repository and pushes it as an image
+# to the owner's registry: <registry>/webigeo-preview:<name>. Started by hand (Actions -> Preview ->
+# Run workflow, input: the branch). It does not run on push or pull request and does not touch
+# the other workflows. The preview server (a Portainer stack that updates from git) pulls the new
+# image by itself. Setup, secrets and variables: .github/preview/README.md
+#
+# No host names, accounts or addresses are written in this file: they all come from the
+# secrets and variables of the "previews" environment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch of this repository to build, e.g. am/lifetime-fixes
+        required: true
+        type: string
+
+concurrency:
+  group: preview-${{ inputs.branch }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    environment: previews
+    env:
+      BRANCH: ${{ inputs.branch }}
+      # Same configuration as the wasm_mt entry of the build-wasm matrix in deploy.yml
+      CONFIG: wasm_mt
+      QT_FLAGS: -release -optimize-size -submodules qtdeclarative,qtbase,qtpositioning -skip qtlanguageserver,qtquicktimeline,qtimageformats -gui $(cat $QT_LITE_CONFIG) -feature-thread
+      CMAKE_FLAGS: -DALP_ENABLE_THREADING=ON -DALP_ENABLE_ASSERTS=OFF
+
+    steps:
+    - name: Name of the preview from the branch
+      id: topic
+      shell: bash
+      run: |
+        # last part of the branch name, lower case, only a-z 0-9 and -, at most 40 characters
+        topic=$(printf '%s' "${BRANCH##*/}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed -E 's/^-+//; s/-+$//' | cut -c1-40)
+        if [ -z "$topic" ]; then
+          echo "::error::Cannot make a preview name from the branch '$BRANCH'"
+          exit 1
+        fi
+        echo "topic=$topic" >> "$GITHUB_OUTPUT"
+        echo "Preview name: $topic"
+
+    - name: Mask the registry address in the logs
+      env:
+        PREVIEW_REGISTRY: ${{ vars.PREVIEW_REGISTRY }}
+      run: echo "::add-mask::$PREVIEW_REGISTRY"
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential ccache ninja-build
+
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.branch }}
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Load CI versions
+      run: |
+        cat .github/ci-versions.env >> "$GITHUB_ENV"
+        echo "BRANCH_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+    - uses: mymindstorm/setup-emsdk@v15
+      with:
+        version: ${{ env.WEBASSEMBLY_VERSION }}
+        actions-cache-folder: emsdk-cache
+        cache-key: emsdk-${{ runner.os }}-${{ env.WEBASSEMBLY_VERSION }}
+
+    - name: Use stable Emscripten path
+      shell: bash
+      run: |
+        STABLE_EMSDK_ROOT="${{ github.workspace }}/emsdk-cache/emsdk-main"
+        if [ ! -x "$STABLE_EMSDK_ROOT/emsdk" ]; then
+          echo "Expected emsdk at $STABLE_EMSDK_ROOT/emsdk"
+          exit 1
+        fi
+
+        "$STABLE_EMSDK_ROOT/emsdk" activate "$WEBASSEMBLY_VERSION"
+        "$STABLE_EMSDK_ROOT/emsdk" construct_env | while IFS= read -r line; do
+          case "$line" in
+            "PATH += "*)
+              echo "${line#PATH += }" >> "$GITHUB_PATH"
+              ;;
+            *" = "*)
+              name="${line%% = *}"
+              value="${line#* = }"
+              echo "$name=$value" >> "$GITHUB_ENV"
+              ;;
+          esac
+        done
+
+    - name: Install Qt native version (required for cross building)
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: ${{ env.QT_VERSION }}
+        host: linux
+        target: 'desktop'
+        arch: linux_gcc_64
+        dir: '${{github.workspace}}/qt_host'
+        install-deps: 'true'
+        modules: 'qtshadertools'
+        cache: true
+        tools: 'tools_cmake'
+
+    - name: Set reusable strings
+      shell: bash
+      run: |
+        echo "BUILD_DIR=$(pwd)/build" >> $GITHUB_ENV
+        echo "INSTALL_DIR=install/${CONFIG}" >> $GITHUB_ENV
+        echo "QT_WASM_ROOT_DIR=$(pwd)/qt_wasm_lite" >> $GITHUB_ENV
+        echo "QT_SRC_CONFIGURE=$(pwd)/qt_src/configure" >> $GITHUB_ENV
+        echo "QT_LITE_CONFIG=$(pwd)/misc/qt_lite.txt" >> $GITHUB_ENV
+
+    # Same cache key as the wasm_mt build of the CI on main, so a preview normally restores
+    # the Qt build from there instead of building Qt from source.
+    - name: Cache Qt WebAssembly build
+      id: qt-cache
+      uses: actions/cache@v6
+      with:
+        path: qt_wasm_lite
+        key: ${{ env.CONFIG }}_qt-${{ env.QT_VERSION }}_emcc-${{ env.WEBASSEMBLY_VERSION }}_qtpositioning_${{ hashFiles('misc/qt_lite.txt', 'misc/qt_68_qtbase_remove_dejavu_fonts.patch') }}
+
+    - name: Download and patch Qt
+      if: steps.qt-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        git clone --branch $QT_VERSION git://code.qt.io/qt/qt5.git qt_src
+        mkdir qt_wasm_build
+        cd qt_wasm_build
+        $QT_SRC_CONFIGURE -qt-host-path $QT_ROOT_DIR -platform wasm-emscripten -init-submodules -submodules qtdeclarative,qtbase,qtpositioning -skip qtlanguageserver,qtquicktimeline,qtimageformats
+        cd ${{github.workspace}}/qt_src/qtbase
+        git apply ${{github.workspace}}/misc/qt_68_qtbase_remove_dejavu_fonts.patch
+        cd ${{ github.workspace }}
+        rm -rf qt_wasm_build
+        mkdir qt_wasm_build
+
+    - name: Build Qt for Webassembly (custom version)
+      if: steps.qt-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cd qt_wasm_build
+        ${{env.QT_SRC_CONFIGURE}} -qt-host-path $QT_ROOT_DIR -platform wasm-emscripten ${{ env.QT_FLAGS }} -prefix "${QT_WASM_ROOT_DIR}/"
+        # fix broken lto=thin build (https://bugreports.qt.io/browse/QTBUG-129522)
+        sed -i 's/-flto=thin/-flto/g' ./build.ninja
+        cmake --build . --parallel && cmake --install .
+        # Fail if the directory is not created or is empty
+        [ -d "$QT_WASM_ROOT_DIR" ] && [ "$(ls -A $QT_WASM_ROOT_DIR)" ] || exit 1
+
+    - name: Remove StatsWindow, otherwise the webassembly will link against qtwidgets and charts.
+      run: rm -f ./app/StatsWindow.qml
+
+    - name: Set ccache config
+      shell: bash
+      run: |
+        echo "ALP_CACHE_CONFIG=${CONFIG}" >> "$GITHUB_ENV"
+        echo "ALP_CACHE_TOOLCHAIN=emscripten-${WEBASSEMBLY_VERSION}-qt-${QT_VERSION}" >> "$GITHUB_ENV"
+        echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_BASEDIR=${{ github.workspace }}" >> "$GITHUB_ENV"
+        echo "CCACHE_COMPRESS=true" >> "$GITHUB_ENV"
+        echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+
+    - name: Cache ccache
+      uses: actions/cache@v6
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ runner.os }}-${{ env.ALP_CACHE_CONFIG }}-${{ env.ALP_CACHE_TOOLCHAIN }}-v3-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ env.ALP_CACHE_CONFIG }}-${{ env.ALP_CACHE_TOOLCHAIN }}-v3-
+
+    - name: Configure
+      env:
+        CMAKE_PREFIX_PATH: ${{env.Qt6_DIR}}/lib/cmake
+      run: >
+        ${QT_WASM_ROOT_DIR}/bin/qt-cmake
+        -G Ninja
+        -B $BUILD_DIR
+        -DCMAKE_BUILD_TYPE=MinSizeRel
+        -DALP_WWW_INSTALL_DIR=$INSTALL_DIR
+        -DFMT_INSTALL=OFF
+        ${{ env.CMAKE_FLAGS }}
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -S ${{ github.workspace }}
+
+    - name: Build
+      run: cmake --build $BUILD_DIR --target install
+
+    - name: Verify WebGPU app artifacts
+      run: |
+        test -f "$INSTALL_DIR/webgpu_app.html"
+        test -f "$INSTALL_DIR/webgpu_app.js"
+        test -f "$INSTALL_DIR/webgpu_app.wasm"
+
+    - name: Prepare the image context
+      run: |
+        mkdir preview_image
+        cp -r "$INSTALL_DIR" preview_image/site
+        cp .github/preview/nginx.conf .github/preview/preview-headers.conf preview_image/
+
+    - name: Log in to the registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ vars.PREVIEW_REGISTRY }}
+        username: ${{ secrets.DOCKER_REPO_USERNAME }}
+        password: ${{ secrets.DOCKER_REPO_PASSWORD }}
+
+    - name: Build the image and push it
+      uses: docker/build-push-action@v6
+      with:
+        context: preview_image
+        file: .github/preview/Dockerfile
+        push: true
+        tags: ${{ vars.PREVIEW_REGISTRY }}/webigeo-preview:${{ steps.topic.outputs.topic }}
+        labels: |
+          org.opencontainers.image.revision=${{ env.BRANCH_SHA }}
+          org.opencontainers.image.description=Web preview of branch ${{ inputs.branch }}
+
+    - name: Summary
+      env:
+        TOPIC: ${{ steps.topic.outputs.topic }}
+        PREVIEW_DOMAIN: ${{ vars.PREVIEW_DOMAIN }}
+      run: |
+        {
+          echo "### Preview image of \`$BRANCH\`"
+          echo
+          echo "Pushed as \`webigeo-preview:$TOPIC\` (commit \`${BRANCH_SHA::10}\`)."
+          echo "The preview server updates from git; the address is"
+          echo
+          echo "https://$TOPIC.$PREVIEW_DOMAIN/webgpu_app.html"
+        } >> "$GITHUB_STEP_SUMMARY"
