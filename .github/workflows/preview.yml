@@ -198,16 +198,26 @@ jobs:
     - name: Build
       run: cmake --build $BUILD_DIR --target install
 
-    - name: Verify WebGPU app artifacts
+    # The app is installed next to the other targets in a subfolder on some branches
+    # (install/<config>/webgpu_app/) and at the top level on others, so look for it.
+    - name: Locate and verify the WebGPU app
       run: |
-        test -f "$INSTALL_DIR/webgpu_app.html"
-        test -f "$INSTALL_DIR/webgpu_app.js"
-        test -f "$INSTALL_DIR/webgpu_app.wasm"
+        html=$(find "$INSTALL_DIR" -name webgpu_app.html | head -n 1)
+        if [ -z "$html" ]; then
+          echo "::error::webgpu_app.html not found below $INSTALL_DIR"
+          find "$INSTALL_DIR" -maxdepth 2 | head -50
+          exit 1
+        fi
+        site=$(dirname "$html")
+        test -f "$site/webgpu_app.js"
+        test -f "$site/webgpu_app.wasm"
+        echo "SITE_DIR=$site" >> "$GITHUB_ENV"
+        echo "App found in $site"
 
     - name: Prepare the image context
       run: |
         mkdir preview_image
-        cp -r "$INSTALL_DIR" preview_image/site
+        cp -r "$SITE_DIR" preview_image/site
         cp .github/preview/nginx.conf .github/preview/preview-headers.conf preview_image/
 
     - name: Log in to the registry
