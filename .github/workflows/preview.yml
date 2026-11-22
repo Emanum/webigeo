@@ -67,6 +67,15 @@ jobs:
         fetch-depth: 0
         fetch-tags: true
 
+    # The image files live on main (the branch being built does not have them).
+    - name: Get the preview files from the workflow's own commit
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ github.sha }}
+        path: preview_src
+        sparse-checkout: .github/preview
+        fetch-depth: 1
+
     - name: Load CI versions
       run: |
         cat .github/ci-versions.env >> "$GITHUB_ENV"
@@ -127,7 +136,7 @@ jobs:
     # the Qt build from there instead of building Qt from source.
     - name: Cache Qt WebAssembly build
       id: qt-cache
-      uses: actions/cache@v6
+      uses: actions/cache/restore@v6
       with:
         path: qt_wasm_lite
         key: ${{ env.CONFIG }}_qt-${{ env.QT_VERSION }}_emcc-${{ env.WEBASSEMBLY_VERSION }}_qtpositioning_${{ hashFiles('misc/qt_lite.txt', 'misc/qt_68_qtbase_remove_dejavu_fonts.patch') }}
@@ -158,6 +167,13 @@ jobs:
         # Fail if the directory is not created or is empty
         [ -d "$QT_WASM_ROOT_DIR" ] && [ "$(ls -A $QT_WASM_ROOT_DIR)" ] || exit 1
 
+    - name: Save the Qt WebAssembly build to the cache
+      if: steps.qt-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: qt_wasm_lite
+        key: ${{ env.CONFIG }}_qt-${{ env.QT_VERSION }}_emcc-${{ env.WEBASSEMBLY_VERSION }}_qtpositioning_${{ hashFiles('misc/qt_lite.txt', 'misc/qt_68_qtbase_remove_dejavu_fonts.patch') }}
+
     - name: Remove StatsWindow, otherwise the webassembly will link against qtwidgets and charts.
       run: rm -f ./app/StatsWindow.qml
 
@@ -173,7 +189,7 @@ jobs:
         echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
 
     - name: Cache ccache
-      uses: actions/cache@v6
+      uses: actions/cache/restore@v6
       with:
         path: ${{ github.workspace }}/.ccache
         key: ccache-${{ runner.os }}-${{ env.ALP_CACHE_CONFIG }}-${{ env.ALP_CACHE_TOOLCHAIN }}-v3-${{ github.run_id }}-${{ github.run_attempt }}
@@ -200,6 +216,13 @@ jobs:
 
     # The app is installed next to the other targets in a subfolder on some branches
     # (install/<config>/webgpu_app/) and at the top level on others, so look for it.
+    - name: Save ccache
+      if: always()
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ runner.os }}-${{ env.ALP_CACHE_CONFIG }}-${{ env.ALP_CACHE_TOOLCHAIN }}-v3-${{ github.run_id }}-${{ github.run_attempt }}
+
     - name: Locate and verify the WebGPU app
       run: |
         html=$(find "$INSTALL_DIR" -name webgpu_app.html | head -n 1)
@@ -218,7 +241,7 @@ jobs:
       run: |
         mkdir preview_image
         cp -r "$SITE_DIR" preview_image/site
-        cp .github/preview/nginx.conf .github/preview/preview-headers.conf preview_image/
+        cp preview_src/.github/preview/nginx.conf preview_src/.github/preview/preview-headers.conf preview_image/
 
     - name: Log in to the registry
       uses: docker/login-action@v3
@@ -231,7 +254,7 @@ jobs:
       uses: docker/build-push-action@v6
       with:
         context: preview_image
-        file: .github/preview/Dockerfile
+        file: preview_src/.github/preview/Dockerfile
         push: true
         tags: ${{ vars.PREVIEW_REGISTRY }}/webigeo-preview:${{ steps.topic.outputs.topic }}
         labels: |
